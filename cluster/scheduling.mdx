@@ -1,0 +1,197 @@
+---
+title: "Task Scheduling: Queues, Routing, and Retry Policy"
+description: "Learn how CPA schedules tasks across workers using priority queues, label-based routing, configurable retry policies, and a dead letter queue for failed tasks."
+keywords: ["task scheduling", "priority queue", "task routing", "retry policy", "dead letter queue", "task lifecycle", "openai cpa scheduling"]
+---
+
+The CPA master node manages a single persistent task queue that drives all work in the cluster. When you submit a task, the master assigns it a priority, matches it to an eligible worker based on engine type and label selectors, and tracks it through its full lifecycle until it completes, fails permanently, or is sent to the dead letter queue. Understanding how the scheduler makes routing decisions and how retry policies interact with task state helps you tune your cluster for reliability and throughput.
+
+## Task queue
+
+All submitted tasks enter the master's task queue before they are dispatched. The queue is priority-ordered — higher-priority tasks are dispatched before lower-priority ones of the same engine type, regardless of submission order. Within the same priority band, tasks are dispatched in first-in, first-out order.
+
+The master dispatches tasks to workers continuously as capacity becomes available. When a worker finishes a task and has free concurrency slots, it immediately polls the master for the next matching task. There is no fixed scheduling interval; dispatch happens in response to worker capacity events.
+
+<Note>
+  The task queue is persisted on the master node. If the master restarts, queued tasks that had not yet been dispatched resume from the queue. Tasks that were in-flight at the time of a master restart are treated as if the worker missed a heartbeat — they are returned to the queue and reassigned when the master comes back online.
+</Note>
+
+## Priority levels
+
+Every task is submitted with one of three priority levels. Priority affects the order in which tasks are dequeued, not the resources allocated to running them.
+
+| Priority | Value | Typical use |
+|---|---|---|
+| `high` | `1` | Time-sensitive extractions, real-time data needs, SLA-bound requests |
+| `normal` | `2` | Standard batch workloads; the default when no priority is specified |
+| `low` | `3` | Background jobs, historical backfills, opportunistic extractions |
+
+Set the priority when submitting a task:
+
+```python
+from openai_cpa import CPAClient
+
+client = CPAClient(master_url="http://master.internal:8080")
+
+task = client.tasks.submit(
+    url="https://example.com/products",
+    engine="protocol",
+    priority="high",
+    tags=["ecommerce", "pricing"],
+)
+```
+
+<Tip>
+  Reserve `high` priority for tasks that directly affect end-user response times. Overusing `high` eliminates the priority advantage and can starve `low`-priority background jobs from making progress if the queue is heavily loaded.
+</Tip>
+
+## Task routing via tags
+
+Tags are the mechanism for directing tasks to specific worker pools. A task with a tag will only be dispatched to workers that have a matching label. Workers without any labels accept any task that matches their engine type, regardless of tags.
+
+**How tag matching works:**
+
+- A task with no tags routes to any worker that matches its engine type.
+- A task with one or more tags routes only to workers that carry all of those tags.
+- A worker with labels receives tasks whose tag set is a subset of its label set.
+
+This lets you build dedicated worker pools for specific workloads. For example, if you have workers labeled `region: eu` for GDPR-compliant extractions, submit those tasks with `tags: [region: eu]` to ensure they only run on EU-region workers.
+
+```yaml
+# worker.yaml — EU-region worker pool
+master_address: "http://master.internal:8080"
+engine: protocol
+concurrency: 12
+labels:
+  region: eu
+  tier: standard
+```
+
+```python
+# Submit a task that routes only to EU workers
+task = client.tasks.submit(
+    url="https://example.eu/data",
+    engine="protocol",
+    tags=["region:eu"],
+)
+```
+
+<Warning>
+  If you submit a task with tags that no currently registered worker satisfies, the task remains in `pending` state indefinitely. Verify that at least one worker with matching labels and the correct engine type is online before submitting tag-constrained tasks.
+</Warning>
+
+## Task status lifecycle
+
+A task moves through a defined set of states from submission to final outcome. The diagram below shows all transitions.
+
+```
+pending → dispatched → running → completed
+                               ↘ failed → (retry) → pending
+                                        → dead (max retries exceeded)
+```
+
+| Status | Description |
+|---|---|
+| `pending` | Task is in the queue waiting for an eligible worker. |
+| `dispatched` | Master has sent the task to a worker; worker has not yet confirmed start. |
+| `running` | Worker has confirmed the task is executing. |
+| `completed` | Task finished successfully; result is available. |
+| `failed` | Task encountered an error; scheduled for retry if retries remain. |
+| `dead` | Task exceeded its maximum retry count; moved to the dead letter queue. |
+
+You can query any task's current status by ID:
+
+```bash
+cpa tasks status <task-id>
+```
+
+## Retry policy and dead letter queue
+
+<AccordionGroup>
+  <Accordion title="Retry policy" defaultOpen={true}>
+    When a task transitions to `failed`, the master applies the retry policy to decide whether to requeue it. You configure retry behavior per task at submission time or through a cluster-wide default in the master configuration.
+
+    **Configurable retry parameters:**
+
+    | Parameter | Default | Description |
+    |---|---|---|
+    | `max_retries` | `3` | Maximum number of retry attempts before the task is marked `dead`. |
+    | `backoff_strategy` | `exponential` | `linear` or `exponential`. Controls the wait between retries. |
+    | `initial_backoff_seconds` | `5` | Wait time before the first retry. |
+    | `backoff_multiplier` | `2.0` | Multiplier applied to each successive wait interval (exponential only). |
+    | `max_backoff_seconds` | `300` | Upper bound on backoff wait, regardless of multiplier. |
+
+    With the defaults, retry wait times are: 5 s → 10 s → 20 s, after which the task is sent to the dead letter queue.
+
+    Set retry options when submitting a task:
+
+    ```python
+    task = client.tasks.submit(
+        url="https://example.com/data",
+        engine="protocol",
+        retry_policy={
+            "max_retries": 5,
+            "backoff_strategy": "exponential",
+            "initial_backoff_seconds": 10,
+            "backoff_multiplier": 2.0,
+            "max_backoff_seconds": 120,
+        },
+    )
+    ```
+
+    <Tip>
+      Use `linear` backoff for transient rate-limit errors where you expect the target to recover on a predictable schedule. Use `exponential` backoff for network-level failures where the issue may take longer to self-resolve.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="Dead letter queue">
+    Tasks that exhaust all retry attempts move to the dead letter queue (DLQ) and are marked `dead`. The DLQ is a separate, persistent store on the master node. Dead tasks are not dispatched to workers and do not consume queue capacity.
+
+    **Inspecting the dead letter queue:**
+
+    ```bash
+    # List all dead tasks
+    cpa tasks list --status dead
+
+    # Show full detail for a specific dead task, including error history
+    cpa tasks inspect <task-id>
+    ```
+
+    The error history for each dead task includes the error message, HTTP status code (if applicable), and timestamp for each failed attempt. This information helps you identify whether the failure was caused by a target-side issue, a proxy problem, or a misconfigured task.
+
+    **Requeuing dead tasks:**
+
+    After you resolve the underlying issue, you can requeue individual dead tasks or all tasks in the DLQ:
+
+    ```bash
+    # Requeue a single dead task
+    cpa tasks requeue <task-id>
+
+    # Requeue all dead tasks (use with caution on large DLQs)
+    cpa tasks requeue --all
+    ```
+
+    Requeued tasks return to `pending` with their original priority and routing configuration. Their retry counter resets to zero, giving them a full set of retry attempts.
+
+    <Warning>
+      Requeuing all dead tasks without first fixing the root cause of failure will cause the same tasks to cycle through retries and return to the DLQ. Always investigate dead task errors before bulk requeuing.
+    </Warning>
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Cluster overview" icon="network" href="/cluster/overview">
+    Master-worker topology, health monitoring, and horizontal scaling.
+  </Card>
+  <Card title="Worker management" icon="server" href="/cluster/worker-management">
+    Adding workers, configuring engine type and labels, and graceful draining.
+  </Card>
+  <Card title="Operations: monitoring" icon="chart-line" href="/operations/monitoring">
+    Metrics, alerts, and dashboards for tracking cluster and task health.
+  </Card>
+  <Card title="Operations: troubleshooting" icon="wrench" href="/operations/troubleshooting">
+    Diagnosing stuck tasks, unhealthy workers, and dead letter queue spikes.
+  </Card>
+</CardGroup>

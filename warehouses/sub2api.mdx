@@ -1,0 +1,344 @@
+---
+title: 'Sub2API: REST API Reference for Account Consumption'
+description: 'Sub2API is the authenticated REST API over the CPA Warehouse. List, retrieve, reserve, and mark accounts as used from any downstream consumer system.'
+keywords: ['sub2api', 'rest api', 'account api', 'api endpoints', 'authentication', 'bearer token']
+---
+
+Sub2API is the HTTP REST API that sits directly in front of the [CPA Warehouse](/warehouses/cpa-warehouse) and exposes stored accounts to downstream consumers. Rather than granting consumers direct database access, Sub2API provides a controlled, authenticated interface with filtering, status management, and rate limiting built in. Every integration — whether a script, a third-party platform, or an internal service — should interact with the warehouse exclusively through Sub2API.
+
+## Authentication
+
+All Sub2API requests must include an API key in the `Authorization` header using the Bearer scheme. Keys are issued per consumer and scoped to specific permissions (read, reserve, use, export).
+
+```bash
+Authorization: Bearer <your-api-key>
+```
+
+<Warning>
+  Never embed API keys in client-side code or commit them to version control. Rotate keys immediately if they are exposed. Keys can be revoked from the operations dashboard under **Settings > API Keys**.
+</Warning>
+
+<Note>
+  If you receive a `401 Unauthorized` response, verify that your key is active and that the `Authorization` header is formatted exactly as shown — the `Bearer ` prefix (with a trailing space) is required.
+</Note>
+
+## Base URL
+
+All endpoints are relative to your instance's Sub2API base URL:
+
+```
+https://your-instance/api/v1
+```
+
+Replace `your-instance` with the hostname configured during [deployment](/operations/deployment).
+
+---
+
+## Endpoints
+
+### List accounts
+
+Returns a paginated list of accounts from the warehouse. Apply query parameters to filter results.
+
+**`GET /accounts`**
+
+#### Query parameters
+
+<ParamField path="query.status" type="string" default="available">
+  Filter by account status. Accepted values: `available`, `reserved`, `used`, `invalid`.
+</ParamField>
+
+<ParamField path="query.platform" type="string">
+  Filter accounts by target platform tag (e.g., `openai`, `google`).
+</ParamField>
+
+<ParamField path="query.tags" type="string[]">
+  Comma-separated list of tags. Only accounts matching all specified tags are returned.
+</ParamField>
+
+<ParamField path="query.registered_after" type="string">
+  ISO 8601 timestamp. Returns accounts registered on or after this date.
+</ParamField>
+
+<ParamField path="query.registered_before" type="string">
+  ISO 8601 timestamp. Returns accounts registered on or before this date.
+</ParamField>
+
+<ParamField path="query.limit" type="number" default="20" placeholder="1-100">
+  Maximum number of accounts to return per page.
+</ParamField>
+
+<ParamField path="query.cursor" type="string">
+  Pagination cursor returned in the previous response's `next_cursor` field.
+</ParamField>
+
+#### Response fields
+
+<ResponseField name="accounts" type="object[]" required>
+  Array of account objects matching the query.
+  <Expandable title="account object properties">
+    <ResponseField name="id" type="string" required>
+      Unique account identifier (UUID).
+    </ResponseField>
+    <ResponseField name="username" type="string" required>
+      Registered username.
+    </ResponseField>
+    <ResponseField name="email" type="string" required>
+      Email address used during registration.
+    </ResponseField>
+    <ResponseField name="status" type="string" required>
+      Current status: `available`, `reserved`, `used`, or `invalid`.
+    </ResponseField>
+    <ResponseField name="platform" type="string" required>
+      Target platform identifier.
+    </ResponseField>
+    <ResponseField name="tags" type="string[]" required>
+      List of tags attached to the account.
+    </ResponseField>
+    <ResponseField name="registration_date" type="string" required>
+      ISO 8601 UTC timestamp of account creation.
+    </ResponseField>
+    <ResponseField name="engine_type" type="string" required>
+      Engine that created the account: `browser` or `protocol`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="total" type="number" required>
+  Total number of accounts matching the query filters (before pagination).
+</ResponseField>
+
+<ResponseField name="next_cursor" type="string">
+  Cursor for the next page. Absent when there are no more results.
+</ResponseField>
+
+<CodeGroup>
+
+```bash cURL
+curl -X GET "https://your-instance/api/v1/accounts?status=available&platform=openai&limit=10" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+```python Python
+import requests
+
+response = requests.get(
+    "https://your-instance/api/v1/accounts",
+    params={"status": "available", "platform": "openai", "limit": 10},
+    headers={"Authorization": "Bearer <your-api-key>"},
+)
+data = response.json()
+```
+
+</CodeGroup>
+
+```json Example response
+{
+  "accounts": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "username": "user_abc123",
+      "email": "user_abc123@mailbox.example",
+      "status": "available",
+      "platform": "openai",
+      "tags": ["campaign-q1", "browser"],
+      "registration_date": "2026-04-20T14:32:00Z",
+      "engine_type": "browser"
+    }
+  ],
+  "total": 842,
+  "next_cursor": "eyJpZCI6ImExYjJjM2Q0In0="
+}
+```
+
+---
+
+### Get a single account
+
+Returns the full record for one account by its ID, including the password field if your key has credential-read permission.
+
+**`GET /accounts/:id`**
+
+#### Path parameters
+
+<ParamField path="path.id" type="string" required>
+  The UUID of the account to retrieve.
+</ParamField>
+
+#### Response fields
+
+<ResponseField name="account" type="object" required>
+  Full account record.
+  <Expandable title="account object properties">
+    <ResponseField name="id" type="string" required>Unique account identifier.</ResponseField>
+    <ResponseField name="username" type="string" required>Registered username.</ResponseField>
+    <ResponseField name="password" type="string">
+      Decrypted password. Only present if the API key has credential-read permission.
+    </ResponseField>
+    <ResponseField name="email" type="string" required>Registration email address.</ResponseField>
+    <ResponseField name="status" type="string" required>Current account status.</ResponseField>
+    <ResponseField name="platform" type="string" required>Target platform identifier.</ResponseField>
+    <ResponseField name="tags" type="string[]" required>Attached tags.</ResponseField>
+    <ResponseField name="registration_date" type="string" required>ISO 8601 registration timestamp.</ResponseField>
+    <ResponseField name="engine_type" type="string" required>Engine that created the account.</ResponseField>
+    <ResponseField name="metadata" type="object">Freeform key-value pairs written by the engine.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<CodeGroup>
+
+```bash cURL
+curl -X GET "https://your-instance/api/v1/accounts/a1b2c3d4-e5f6-7890-abcd-ef1234567890" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+```python Python
+import requests
+
+account_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+response = requests.get(
+    f"https://your-instance/api/v1/accounts/{account_id}",
+    headers={"Authorization": "Bearer <your-api-key>"},
+)
+account = response.json()["account"]
+```
+
+</CodeGroup>
+
+---
+
+### Reserve an account
+
+Transitions an account from `available` to `reserved`, preventing other consumers from claiming it. The reservation is tied to the API key that made the request.
+
+**`POST /accounts/:id/reserve`**
+
+#### Path parameters
+
+<ParamField path="path.id" type="string" required>
+  The UUID of the account to reserve.
+</ParamField>
+
+#### Response fields
+
+<ResponseField name="id" type="string" required>Account UUID.</ResponseField>
+<ResponseField name="status" type="string" required>New status — always `reserved` on success.</ResponseField>
+<ResponseField name="reserved_at" type="string" required>ISO 8601 timestamp of when the reservation was created.</ResponseField>
+<ResponseField name="reserved_by" type="string" required>Identifier of the API key that reserved the account.</ResponseField>
+
+<CodeGroup>
+
+```bash cURL
+curl -X POST "https://your-instance/api/v1/accounts/a1b2c3d4-e5f6-7890-abcd-ef1234567890/reserve" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+```python Python
+import requests
+
+account_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+response = requests.post(
+    f"https://your-instance/api/v1/accounts/{account_id}/reserve",
+    headers={"Authorization": "Bearer <your-api-key>"},
+)
+```
+
+</CodeGroup>
+
+```json Example response
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "status": "reserved",
+  "reserved_at": "2026-04-24T09:15:00Z",
+  "reserved_by": "key_consumer_prod_01"
+}
+```
+
+---
+
+### Mark an account as used
+
+Transitions an account from `reserved` to `used`. Call this endpoint once you have successfully consumed the account credentials.
+
+**`POST /accounts/:id/use`**
+
+#### Path parameters
+
+<ParamField path="path.id" type="string" required>
+  The UUID of the account to mark as used.
+</ParamField>
+
+#### Response fields
+
+<ResponseField name="id" type="string" required>Account UUID.</ResponseField>
+<ResponseField name="status" type="string" required>New status — always `used` on success.</ResponseField>
+<ResponseField name="used_at" type="string" required>ISO 8601 timestamp of when the account was marked used.</ResponseField>
+
+<CodeGroup>
+
+```bash cURL
+curl -X POST "https://your-instance/api/v1/accounts/a1b2c3d4-e5f6-7890-abcd-ef1234567890/use" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+```python Python
+import requests
+
+account_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+response = requests.post(
+    f"https://your-instance/api/v1/accounts/{account_id}/use",
+    headers={"Authorization": "Bearer <your-api-key>"},
+)
+```
+
+</CodeGroup>
+
+```json Example response
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "status": "used",
+  "used_at": "2026-04-24T09:22:00Z"
+}
+```
+
+---
+
+## Error responses
+
+All errors follow a consistent structure:
+
+```json
+{
+  "error": {
+    "code": "account_not_found",
+    "message": "No account with the given ID exists in the warehouse.",
+    "status": 404
+  }
+}
+```
+
+| HTTP status | Error code | Meaning |
+|---|---|---|
+| `400` | `invalid_filter` | A query parameter has an unsupported value. |
+| `401` | `unauthorized` | Missing or invalid API key. |
+| `403` | `forbidden` | API key lacks permission for this operation. |
+| `404` | `account_not_found` | No account with the given ID exists. |
+| `409` | `status_conflict` | The account is not in a valid state for the requested transition. |
+| `429` | `rate_limited` | Request rate exceeded. Retry after the `Retry-After` header value. |
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="CPA Warehouse" icon="database" href="/warehouses/cpa-warehouse">
+    Understand account records, status lifecycle, and export options.
+  </Card>
+  <Card title="Integration guide" icon="link" href="/warehouses/integration">
+    Set up webhooks and connect third-party systems to Sub2API.
+  </Card>
+  <Card title="Deployment" icon="server" href="/operations/deployment">
+    Configure your Sub2API instance base URL and API key management.
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/operations/troubleshooting">
+    Diagnose common Sub2API errors and connectivity issues.
+  </Card>
+</CardGroup>

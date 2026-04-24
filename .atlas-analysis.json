@@ -1,0 +1,84 @@
+{
+  "projectType": "saas",
+  "projectName": "OpenAI CPA",
+  "projectDescription": "A distributed automation platform with dual-engine architecture (high-speed protocol engine and anti-detection browser engine) for high-scale account registration, orchestrating cluster workers, mail engines, and CPA/Sub2API warehouses.",
+  "theme": "aspen",
+  "primaryColor": "#1a56db",
+  "lightColor": "#3b82f6",
+  "darkColor": "#1e3a8a",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Core Engines",
+            "pages": [
+              "engines/overview",
+              "engines/protocol-engine",
+              "engines/browser-engine"
+            ]
+          },
+          {
+            "group": "Cluster & Workers",
+            "pages": [
+              "cluster/overview",
+              "cluster/worker-management",
+              "cluster/scheduling"
+            ]
+          },
+          {
+            "group": "Mail Engine",
+            "pages": [
+              "mail/overview",
+              "mail/configuration",
+              "mail/providers"
+            ]
+          },
+          {
+            "group": "Warehouses & APIs",
+            "pages": [
+              "warehouses/cpa-warehouse",
+              "warehouses/sub2api",
+              "warehouses/integration"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/deployment",
+              "operations/monitoring",
+              "operations/troubleshooting"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Dual-engine architecture: high-speed protocol engine for raw throughput and anti-detection browser engine for realistic behavior",
+    "Distributed cluster orchestration with horizontal worker scaling",
+    "Built-in mail engine supporting multiple email providers for registration flows",
+    "CPA warehouse for managing affiliate/cost-per-action account inventories",
+    "Sub2API warehouse exposing registered accounts via API for downstream consumers",
+    "Anti-detection browser with fingerprint randomization to bypass bot detection",
+    "High-scale concurrent registration across multiple platforms",
+    "Centralized task scheduling and worker health monitoring"
+  ],
+  "publicApiSurface": [
+    "Sub2API — HTTP API endpoints for consuming registered account inventory",
+    "CPA Warehouse — account storage and retrieval interface",
+    "Cluster management API — worker registration, task dispatch, status polling",
+    "Mail Engine API — inbox polling, verification code extraction",
+    "Protocol Engine — high-throughput registration task runner",
+    "Browser Engine — anti-detection Chromium-based task runner"
+  ]
+}

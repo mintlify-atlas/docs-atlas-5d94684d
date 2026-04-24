@@ -1,0 +1,192 @@
+---
+title: 'Troubleshoot OpenAI CPA: Workers, Tasks, Mail, and APIs'
+description: 'Diagnose and fix workers not connecting, stuck pending tasks, low success rates, Mail Engine verification failures, and empty Sub2API results step by step.'
+keywords: ['troubleshooting', 'debug', 'workers', 'tasks', 'mail engine', 'sub2api', 'CPA']
+---
+
+Most operational problems in an OpenAI CPA cluster fall into a small set of repeating patterns: connectivity issues at startup, capacity mismatches that cause tasks to queue indefinitely, detection-related failures that lower your success rate, mail delivery problems that block verification steps, and misconfigured warehouse filters that return empty results. This page covers all five categories with specific things to check and concrete fixes.
+
+<Tip>
+  Before diving into a specific issue, always start with `GET /status` on the master node. The cluster state snapshot often points directly at the problem — a missing worker, a growing queue, or elevated failure counts.
+</Tip>
+
+## Common issues
+
+<AccordionGroup>
+  <Accordion title="Workers not connecting to master" icon="plug">
+    Workers fail to register on startup, or they appear in master logs as `connection_refused` or `unreachable`.
+
+    **Symptoms**
+    - `GET /status` returns `"workers": []` even after starting workers
+    - Worker logs contain: `Failed to register with master: connect ECONNREFUSED`
+    - Worker logs contain: `getaddrinfo ENOTFOUND <hostname>`
+
+    **Causes and fixes**
+
+    1. **Wrong `MASTER_ADDRESS` on the worker.** Open the worker's `.env` and confirm `MASTER_ADDRESS` matches the master's actual IP and port.
+
+       ```ini
+       # Correct — use IP or resolvable hostname, not localhost
+       MASTER_ADDRESS=http://10.0.1.5:4000
+       ```
+
+    2. **Firewall blocking the master port.** The master listens on `MASTER_PORT` (default `4000`). Check that inbound TCP traffic is allowed on worker → master:
+
+       ```bash
+       # Test from the worker machine
+       nc -zv 10.0.1.5 4000
+       ```
+
+       If it times out, open the port in your firewall or security group rules.
+
+    3. **Master not yet started.** Workers attempt registration immediately on boot. Start the master first and wait for it to log `Master listening on :4000` before starting workers.
+
+    <Warning>
+      Never set `MASTER_ADDRESS=http://localhost:4000` on a worker running on a different machine. Use the master's network-accessible IP or hostname.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="Tasks stuck in pending" icon="clock">
+    Tasks are submitted but never picked up, and `task_queue_depth` keeps climbing.
+
+    **Symptoms**
+    - `GET /status` shows `task_queue_depth` > 0 with workers in `idle` state
+    - Tasks remain in `pending` indefinitely with no assignment log entries
+    - Workers are registered but show `tasks_completed` not incrementing
+
+    **Causes and fixes**
+
+    1. **No available workers of the required engine type.** The scheduler only assigns a task to a worker whose `ENGINE_TYPE` matches the task's engine requirement. If all your tasks require `browser` but you only have `protocol` workers registered, every task will queue forever.
+
+       Check registered worker engines:
+
+       ```bash
+       curl http://<master-ip>:4000/status | jq '.workers[] | {id, engine, status}'
+       ```
+
+       Start workers with the matching engine type:
+
+       ```bash
+       cpa-server start --role worker --engine browser --config .env
+       ```
+
+    2. **All workers busy and concurrency is maxed.** If workers are `busy` and `WORKER_CONCURRENCY` is at its limit, tasks queue until a slot frees. Either increase `WORKER_CONCURRENCY` in your worker `.env` (within your RAM budget) or add more worker nodes.
+
+    3. **Workers registered but marked `unreachable`.** The master may have lost heartbeat contact with a worker that still appears connected. Restart the affected worker process to force a clean re-registration.
+
+    <Note>
+      Browser Engine workers process tasks more slowly due to Chromium overhead. A small fleet of Browser Engine workers will queue tasks faster than Protocol Engine workers under the same load. See [worker management](/cluster/worker-management) for scaling guidance.
+    </Note>
+  </Accordion>
+
+  <Accordion title="Low task success rate" icon="triangle-exclamation">
+    A high proportion of tasks are completing with a `failed` or `blocked` status.
+
+    **Symptoms**
+    - `/metrics` shows `cpa_tasks_total{status="failed"}` rising faster than `completed`
+    - Task logs contain: `proxy connection refused`, `CAPTCHA detected`, or `fingerprint challenge`
+    - Success rate drops suddenly after a period of normal operation
+
+    **Causes and fixes**
+
+    1. **Proxy pool exhausted or unhealthy.** If your proxy provider is returning errors or the pool is depleted, all outbound requests will fail. Verify your proxy configuration and rotate to fresh proxies.
+
+       ```bash
+       # Check proxy health in task logs
+       grep "proxy_error" /var/log/cpa/worker.log | tail -20
+       ```
+
+    2. **Fingerprint detection triggering blocks.** Sites may have updated their detection logic. Switch affected task types to Browser Engine workers, which provide full browser fingerprinting, and review your fingerprint profile configuration.
+
+    3. **CAPTCHA failures increasing.** If CAPTCHA solving is integrated, confirm the solver service is reachable and has remaining credits. Check for HTTP 402 or 429 responses from the solver in worker logs.
+
+    <Warning>
+      A sudden drop in success rate on a previously stable cluster almost always indicates an external change — a target site updated its bot detection, or your proxy pool was flagged. Check external factors before adjusting internal configuration.
+    </Warning>
+
+    <Tip>
+      Enable `LOG_LEVEL=debug` on one worker temporarily to see the full request/response cycle for failing tasks. This gives you the exact HTTP status codes and response bodies that are triggering failures.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="Mail Engine not receiving verification codes" icon="envelope-open">
+    Tasks that require email verification hang waiting for a code that never arrives, eventually timing out.
+
+    **Symptoms**
+    - Task logs show: `Waiting for verification code... timeout after Xms`
+    - Mail Engine logs show inbox polling completing but no code extracted
+    - Codes are visible in the inbox but not delivered to the task
+
+    **Causes and fixes**
+
+    1. **Inbox polling timeout set too low.** If the sending service is slow and the polling timeout expires before the email arrives, the code is never read. Increase `MAIL_POLL_TIMEOUT_MS` in your configuration.
+
+       ```ini
+       # Default is 15000ms — increase for slow senders
+       MAIL_POLL_TIMEOUT_MS=45000
+       ```
+
+    2. **Incorrect or overly specific regex pattern.** The Mail Engine uses a regex to extract codes from email bodies. If the sending service changed its email template, the pattern may no longer match.
+
+       Test your pattern against a raw email body:
+
+       ```bash
+       echo "Your verification code is: 847291" | grep -oP '\d{6}'
+       ```
+
+       Update `MAIL_CODE_REGEX` in your configuration to match the current email format.
+
+    3. **Wrong mailbox or credentials.** Confirm `MAIL_IMAP_HOST`, `MAIL_IMAP_USER`, and `MAIL_IMAP_PASS` are correct and that IMAP access is enabled on the account. Some providers (Gmail, Outlook) require app-specific passwords when 2FA is enabled.
+
+    See [mail configuration](/mail/configuration) for the full list of Mail Engine settings.
+  </Accordion>
+
+  <Accordion title="Sub2API returning empty results" icon="database">
+    Calls to the Sub2API warehouse return an empty array or zero results even when accounts should be available.
+
+    **Symptoms**
+    - API response: `{ "results": [], "count": 0 }`
+    - Tasks that depend on warehouse data fail immediately with no accounts to process
+    - Results were non-empty previously with the same query
+
+    **Causes and fixes**
+
+    1. **Warehouse stock depleted.** The CPA Warehouse may have run out of accounts matching your query. Check current inventory:
+
+       ```bash
+       curl http://<master-ip>:4000/warehouses/cpa-warehouse/status
+       ```
+
+       If stock is at zero, replenish the warehouse before running further tasks.
+
+    2. **Filters are too restrictive.** If you are filtering by country, account age, or other attributes, you may have narrowed the pool to zero. Relax your filter criteria incrementally to find where the results drop off.
+
+       ```bash
+       # Start with no filters to confirm stock exists
+       curl "http://<master-ip>:4000/warehouses/sub2api/query"
+
+       # Then add filters one at a time
+       curl "http://<master-ip>:4000/warehouses/sub2api/query?country=US"
+       ```
+
+    3. **Integration misconfiguration.** If Sub2API is configured to pull from an upstream source, verify the integration credentials and upstream API endpoint are correct. See [warehouse integration](/warehouses/integration) for integration setup details.
+
+    <Warning>
+      Depleting the warehouse completely will cause all dependent tasks to fail immediately rather than queue. Monitor warehouse stock levels as part of your standard operational dashboards.
+    </Warning>
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={3}>
+  <Card title="Deployment" icon="rocket" href="/operations/deployment">
+    System requirements and step-by-step cluster setup.
+  </Card>
+  <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+    Metrics endpoints, log levels, and alerting thresholds.
+  </Card>
+  <Card title="Cluster overview" icon="diagram-project" href="/cluster/overview">
+    How the master and worker nodes interact during normal operation.
+  </Card>
+</CardGroup>

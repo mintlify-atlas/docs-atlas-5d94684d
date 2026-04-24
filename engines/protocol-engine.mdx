@@ -1,0 +1,176 @@
+---
+title: "Protocol Engine: High-Throughput HTTP Registration"
+description: "Learn how OpenAI CPA's Protocol Engine executes raw HTTP registrations, configure concurrency and proxy pools, and tune it for maximum throughput."
+keywords: ["protocol engine", "http engine", "high throughput", "concurrency", "proxy pool", "header spoofing", "request fingerprinting"]
+---
+
+The Protocol Engine is OpenAI CPA's high-throughput execution layer. Instead of launching a browser, it constructs and sends raw HTTP requests directly against the target registration endpoint. This approach eliminates all browser process overhead — no DOM rendering, no JavaScript engine, no Chromium subprocess — which means a single worker running the Protocol Engine can sustain dozens to hundreds of concurrent registration sessions on modest hardware.
+
+## How it works
+
+The Protocol Engine operates entirely at the HTTP/protocol layer. For each registration task it receives, it:
+
+1. Builds the request payload (form data or JSON) from the task definition
+2. Applies the configured header profile — user-agent, accept-encoding, accept-language, and other headers that make the request resemble a real browser
+3. Routes the request through the assigned proxy
+4. Manages the HTTP session — cookies, redirects, and session tokens — across multi-step registration flows
+5. Parses the response to determine whether the step succeeded or requires a retry
+6. Hands off email verification steps to the Mail Engine when a verification code is required
+7. Reports the completed account or failure reason back to the master node
+
+Because there is no browser startup time or rendering pipeline, the time between task receipt and first request is measured in milliseconds. Task latency is dominated by network round-trip time and the target server's response time.
+
+<Warning>
+  The Protocol Engine cannot execute JavaScript. If a target's registration form relies on client-side JS to build the submission payload, validate fields, or generate tokens, the Protocol Engine will produce malformed or rejected requests. Use the Browser Engine for those targets instead.
+</Warning>
+
+## Setup
+
+<Steps>
+  <Step title="Configure a worker for the Protocol Engine">
+    In your worker configuration file, set `engine` to `protocol`. This tells the worker to request only Protocol Engine tasks from the master.
+
+    ```yaml worker.yaml
+    engine: protocol
+    master_url: "http://your-master-host:8080"
+    worker_id: "worker-proto-01"
+    concurrency: 50
+    proxy_pool: "residential-us"
+    request_timeout: 30
+    retry:
+      max_attempts: 3
+      backoff: "exponential"
+      backoff_base_ms: 500
+    ```
+  </Step>
+  <Step title="Assign a proxy pool">
+    The Protocol Engine routes every request through the proxy pool named in the `proxy_pool` field. Define your proxy pools in the master's configuration and reference them by name in each worker config. You can use different proxy pools across different workers to segment traffic by geography or proxy quality.
+  </Step>
+  <Step title="Set concurrency limits">
+    The `concurrency` value controls how many registration sessions the worker runs in parallel. Start conservatively — around 20–30 — and increase it while monitoring CPU, memory, and task failure rate. Protocol Engine workers are CPU- and network-bound; they are not limited by memory the way Browser Engine workers are.
+  </Step>
+  <Step title="Submit tasks targeting the Protocol Engine">
+    When submitting tasks to the master's API, set `"engine": "protocol"` in the task payload. The master will route these tasks exclusively to workers configured for the Protocol Engine.
+
+    ```json task-submission.json
+    {
+      "engine": "protocol",
+      "target": "example-platform",
+      "count": 100,
+      "proxy_pool": "residential-us",
+      "priority": 1
+    }
+    ```
+  </Step>
+</Steps>
+
+## Configuration reference
+
+The following options are available in the worker configuration file for Protocol Engine workers.
+
+```yaml worker.yaml
+engine: protocol
+master_url: "http://master-host:8080"
+worker_id: "worker-proto-01"
+
+# Concurrency: number of parallel registration sessions this worker runs
+concurrency: 50
+
+# Proxy pool: name of the proxy pool defined in master config
+proxy_pool: "residential-us"
+
+# Request timeout in seconds — applies per individual HTTP request
+request_timeout: 30
+
+# Header profile: controls the fingerprinting headers applied to each request
+header_profile:
+  user_agent_rotation: true
+  accept_language: "en-US,en;q=0.9"
+  accept_encoding: "gzip, deflate, br"
+  randomize_order: true
+
+# Retry policy for failed requests
+retry:
+  max_attempts: 3
+  backoff: "exponential"       # "fixed", "linear", or "exponential"
+  backoff_base_ms: 500
+  retry_on_status: [429, 502, 503, 504]
+
+# TLS fingerprinting: use a browser-like TLS client hello
+tls_fingerprint: "chrome-120"  # "chrome-120", "firefox-121", "safari-17", "none"
+```
+
+### Key configuration options
+
+| Option | Type | Description |
+|---|---|---|
+| `concurrency` | integer | Parallel sessions per worker. Increase for higher throughput. |
+| `proxy_pool` | string | Name of the proxy pool to use for all requests from this worker. |
+| `request_timeout` | integer | Seconds before a single HTTP request is abandoned. |
+| `header_profile.user_agent_rotation` | boolean | Rotate user-agent strings across sessions to reduce fingerprinting risk. |
+| `header_profile.randomize_order` | boolean | Shuffle header order to avoid static fingerprinting. |
+| `retry.max_attempts` | integer | Total attempts before a task is marked as failed. |
+| `retry.backoff` | string | Backoff strategy between retries: `fixed`, `linear`, or `exponential`. |
+| `tls_fingerprint` | string | TLS client hello profile. Use a browser profile to avoid TLS-level detection. |
+
+## When to use the Protocol Engine
+
+The Protocol Engine is the right choice when:
+
+- You have confirmed the target does not perform browser fingerprint or canvas checks
+- The registration form submits via a standard HTTP POST or JSON API call
+- You need the highest possible registrations per minute and resources per worker are limited
+- The target's anti-bot measures are limited to IP-rate limiting or simple user-agent checks, both of which the Protocol Engine's proxy rotation and header spoofing handle adequately
+
+If a target was previously working with the Protocol Engine and begins returning high failure or block rates, check whether the target has deployed new bot detection. Switching affected tasks to the Browser Engine is usually the correct response.
+
+## Performance tuning
+
+<Tip>
+  The single most impactful tuning knob for the Protocol Engine is `concurrency`. Most workers can sustain 50–100 concurrent sessions without saturating CPU. If your worker machine has high network bandwidth and low CPU usage at your current concurrency setting, raise it in increments of 20 and watch the task success rate.
+</Tip>
+
+<Tip>
+  Exponential backoff on retries prevents thundering-herd effects when a target temporarily rate-limits your worker. Set `backoff_base_ms` to 500–1000ms and `max_attempts` to 3–5. Retrying too aggressively against a rate-limited endpoint will extend the block window.
+</Tip>
+
+<Tip>
+  Enable `tls_fingerprint: "chrome-120"` for targets that inspect TLS client hello parameters. Without a browser-like TLS fingerprint, some targets can identify automated clients at the connection layer before they even parse the HTTP headers.
+</Tip>
+
+<Warning>
+  Do not set `concurrency` above the capacity of your proxy pool. If you run 100 concurrent sessions through a pool of 10 proxies, each proxy handles 10 simultaneous connections. Most residential proxy providers will flag or block IPs under that load. Keep concurrency-to-proxy ratios at or below 5:1 for residential proxies, or use datacenter proxies with higher connection limits.
+</Warning>
+
+## Limitations
+
+The Protocol Engine has a defined set of capabilities and a defined set of things it cannot do. Understanding these boundaries prevents misapplying it to unsuitable targets.
+
+<AccordionGroup>
+  <Accordion title="No JavaScript execution">
+    The Protocol Engine does not embed a JavaScript runtime. It cannot evaluate scripts served by the page, solve JS-based challenges, or generate tokens that require client-side computation. If the target's registration endpoint requires a JavaScript-generated value in the payload, use the Browser Engine.
+  </Accordion>
+  <Accordion title="No CAPTCHA solving">
+    The Protocol Engine has no CAPTCHA integration. If the registration flow presents a CAPTCHA gate, the Protocol Engine has no mechanism to solve it. CAPTCHA solving is a Browser Engine feature.
+  </Accordion>
+  <Accordion title="Limited evasion against advanced fingerprinting">
+    Header spoofing and TLS fingerprint emulation reduce but do not eliminate detection risk on targets that perform deep fingerprinting. Canvas fingerprints, WebGL parameters, and behavioral analysis (mouse movement, typing cadence) are not emulated at the protocol layer. For targets that rely on these signals, the Browser Engine is required.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Browser Engine" icon="browser" href="/engines/browser-engine">
+    When the Protocol Engine is not enough, the Browser Engine handles fingerprinting, JS challenges, and CAPTCHAs.
+  </Card>
+  <Card title="Engine overview" icon="layers" href="/engines/overview">
+    Side-by-side comparison of both engines and guidance on choosing between them.
+  </Card>
+  <Card title="Worker management" icon="server" href="/cluster/worker-management">
+    How to deploy, configure, and scale Protocol Engine worker pools in your cluster.
+  </Card>
+  <Card title="Cluster scheduling" icon="calendar" href="/cluster/scheduling">
+    How the master node routes tasks to the correct engine pool and manages concurrency across workers.
+  </Card>
+</CardGroup>

@@ -1,0 +1,211 @@
+---
+title: "Browser Engine: Anti-Detection Chromium Automation"
+description: "How OpenAI CPA's Browser Engine randomizes fingerprints, simulates human behavior, and integrates CAPTCHA solvers to bypass advanced bot detection."
+keywords: ["browser engine", "anti-detection", "chromium", "fingerprint randomization", "captcha solver", "bot detection", "headless browser"]
+---
+
+The Browser Engine is OpenAI CPA's anti-detection execution layer. It runs full Chromium browser sessions — one per registration task — with randomized fingerprints, human-like interaction simulation, and CAPTCHA solver integration. Where the Protocol Engine sends raw HTTP requests, the Browser Engine renders pages exactly as a real browser would, making it effective against targets that use fingerprint analysis, JavaScript challenges, or behavioral detection to filter out automated traffic.
+
+## How it works
+
+Each Browser Engine task spawns an isolated Chromium browser context. The engine applies a fingerprint profile to the context before navigating to the registration page, then drives the registration flow by simulating realistic user interactions.
+
+The execution sequence for a typical registration task:
+
+1. The worker receives a Browser Engine task from the master node
+2. A new Chromium context is created with a randomized fingerprint profile applied — canvas, WebGL, user-agent, screen resolution, timezone, and language are all set before the first page load
+3. The engine navigates to the registration URL through the assigned proxy
+4. Form fields are filled using simulated typing with randomized inter-keystroke delays
+5. Mouse movements follow randomized curved paths rather than straight-line teleports
+6. If a CAPTCHA appears, the engine pauses and delegates to the configured solver service, then injects the solution token
+7. If email verification is required, the engine requests a code from the Mail Engine and enters it into the verification field
+8. On successful completion, the engine extracts the account credentials and reports them to the master
+9. The browser context is destroyed and the worker is available for the next task
+
+<Note>
+  Each concurrent Browser Engine task requires its own Chromium process. On a worker running 5 concurrent tasks, expect 1.5–2.5 GB of RAM consumption from browser processes alone, in addition to system and worker process overhead. Plan hardware accordingly.
+</Note>
+
+## Anti-detection features
+
+The Browser Engine's core value is its anti-detection stack. The following features work together to make each session appear as a distinct, organic browser user.
+
+<AccordionGroup>
+  <Accordion title="Canvas fingerprint randomization">
+    Canvas fingerprinting works by drawing an invisible image to an HTML5 canvas element and reading back the pixel data. Subtle rendering differences between GPU drivers and operating systems produce a near-unique signature per device. The Browser Engine injects a small, per-session noise offset into canvas pixel data before it is read by the page's fingerprinting script. Each session produces a different canvas signature, preventing cross-session correlation.
+  </Accordion>
+  <Accordion title="WebGL parameter spoofing">
+    WebGL exposes GPU vendor strings, renderer strings, and supported extension lists that are highly stable per device — making them reliable fingerprinting signals. The Browser Engine substitutes randomized-but-plausible WebGL parameter sets, drawing from a curated pool of real GPU profiles. The substituted values are internally consistent (matching vendor and renderer strings are paired correctly) to avoid triggering validation checks that look for implausible combinations.
+  </Accordion>
+  <Accordion title="User-agent and platform spoofing">
+    The Browser Engine sets the user-agent string, `navigator.platform`, `navigator.userAgentData`, and related JavaScript properties to match a selected browser profile. These values are kept internally consistent — a Chrome 120 user-agent is paired with Chrome 120 platform data — because inconsistencies between the HTTP header user-agent and the JS-accessible `navigator` properties are a well-known detection signal.
+  </Accordion>
+  <Accordion title="Screen resolution and color depth">
+    `window.screen.width`, `window.screen.height`, `window.screen.colorDepth`, and `window.devicePixelRatio` are set to values drawn from a realistic distribution of common monitor configurations. The values are stable within a session but vary between sessions, matching the behavior of a real user on different devices.
+  </Accordion>
+  <Accordion title="Timezone and locale settings">
+    The browser's timezone (`Intl.DateTimeFormat().resolvedOptions().timeZone`) and language (`navigator.language`, `navigator.languages`) are aligned with the proxy's geographic location when `geo_align: true` is set in the fingerprint profile. This prevents the mismatch between a US-based IP address and a browser reporting an Asian timezone, which is a common detection heuristic.
+  </Accordion>
+  <Accordion title="Human-like interaction simulation">
+    Mouse movements between interactive elements follow Bezier-curve paths with randomized control points and variable speed, rather than straight-line teleports. Typing delays between keystrokes are drawn from a distribution that approximates human typing patterns, including occasional brief pauses between words. Scroll events use momentum-based timing. These behavioral signals are checked by some bot detection systems that build a "humanness score" from interaction patterns.
+  </Accordion>
+</AccordionGroup>
+
+## Setup
+
+<Steps>
+  <Step title="Configure a worker for the Browser Engine">
+    Set `engine` to `browser` in your worker configuration file. Configure the concurrency limit conservatively — each concurrent task is a full browser process.
+
+    ```yaml worker.yaml
+    engine: browser
+    master_url: "http://your-master-host:8080"
+    worker_id: "worker-browser-01"
+    concurrency: 5
+    proxy_pool: "residential-us"
+    browser:
+      headless: true
+      fingerprint_profile: "random"
+      geo_align: true
+      captcha_solver:
+        provider: "2captcha"
+        api_key: "YOUR_SOLVER_API_KEY"
+        timeout: 120
+    ```
+  </Step>
+  <Step title="Choose headless or headful mode">
+    Set `browser.headless: true` for production deployments — headless mode uses less memory and does not require a display server. Set `headless: false` during development and debugging so you can observe the browser session visually and identify where a registration flow is failing.
+
+    <Note>
+      Some targets detect headless Chromium via the `navigator.webdriver` property and related signals. The Browser Engine patches these properties by default, but a small number of highly aggressive detection systems may still identify headless mode. If you encounter this, some detection bypasses require `headless: false` with a virtual display (Xvfb).
+    </Note>
+  </Step>
+  <Step title="Configure CAPTCHA solver integration">
+    If your target presents CAPTCHAs, configure a solver service under `browser.captcha_solver`. The Browser Engine currently supports 2captcha and CapMonster as solver providers. Set the `api_key` to your solver account's API key and `timeout` to the maximum seconds you want to wait for a solution before treating the task as failed.
+  </Step>
+  <Step title="Submit tasks targeting the Browser Engine">
+    Set `"engine": "browser"` in task submissions to route them to Browser Engine workers.
+
+    ```json task-submission.json
+    {
+      "engine": "browser",
+      "target": "hardened-platform",
+      "count": 20,
+      "proxy_pool": "residential-us",
+      "priority": 1
+    }
+    ```
+  </Step>
+</Steps>
+
+## Configuration reference
+
+```yaml worker.yaml
+engine: browser
+master_url: "http://master-host:8080"
+worker_id: "worker-browser-01"
+
+# Concurrency: simultaneous browser sessions on this worker
+# Keep at 3–8 on a 16 GB RAM machine; raise carefully while monitoring memory
+concurrency: 5
+
+# Proxy pool name as defined in master config
+proxy_pool: "residential-us"
+
+browser:
+  # headless: true for production; false for debugging with a visible browser window
+  headless: true
+
+  # fingerprint_profile: "random" generates a new profile per session
+  # You can also specify a named static profile for consistency testing
+  fingerprint_profile: "random"
+
+  # geo_align: align timezone and language with the proxy's IP geolocation
+  geo_align: true
+
+  # typing_speed_wpm: approximate words-per-minute for simulated typing
+  # Accepts a range; actual speed is sampled randomly within it each session
+  typing_speed_wpm: [40, 80]
+
+  # mouse_speed: "slow", "normal", or "fast" — controls Bezier path timing
+  mouse_speed: "normal"
+
+  # page_load_timeout: seconds to wait for a page to finish loading
+  page_load_timeout: 45
+
+  # captcha_solver: configure a CAPTCHA solving service
+  captcha_solver:
+    provider: "2captcha"       # "2captcha" or "capmonster"
+    api_key: "YOUR_API_KEY"
+    timeout: 120               # seconds to wait for a CAPTCHA solution
+
+  # launch_args: additional Chromium launch arguments
+  launch_args:
+    - "--disable-blink-features=AutomationControlled"
+    - "--no-sandbox"
+```
+
+### Key configuration options
+
+| Option | Type | Description |
+|---|---|---|
+| `concurrency` | integer | Parallel browser sessions per worker. Keep low relative to available RAM. |
+| `browser.headless` | boolean | Run Chromium without a display. `false` for debugging only. |
+| `browser.fingerprint_profile` | string | `"random"` for a new profile per session, or a named static profile. |
+| `browser.geo_align` | boolean | Match timezone and language to the proxy IP's geolocation. |
+| `browser.typing_speed_wpm` | array | Range for simulated typing speed in words per minute. |
+| `browser.mouse_speed` | string | Controls Bezier curve timing for mouse movements. |
+| `browser.page_load_timeout` | integer | Seconds before a page load is considered failed. |
+| `browser.captcha_solver.provider` | string | CAPTCHA solving service: `"2captcha"` or `"capmonster"`. |
+| `browser.captcha_solver.timeout` | integer | Seconds to wait for a CAPTCHA solution before failing the task. |
+
+## When to use the Browser Engine
+
+Use the Browser Engine for targets that employ one or more of the following:
+
+- **Cloudflare Bot Management or Turnstile** — these systems check browser fingerprints and behavioral signals that the Protocol Engine cannot satisfy
+- **reCAPTCHA v2 or v3, hCaptcha** — CAPTCHA challenges require a real browser context and a solver integration
+- **Canvas or WebGL fingerprinting** — client-side scripts that read canvas or WebGL data to generate a device ID
+- **JavaScript-rendered registration forms** — forms built with React, Angular, or similar frameworks that require JS execution to render fields and build submission payloads
+- **Behavioral analysis checkpoints** — systems that score mouse movement, typing patterns, or scroll behavior to assign a bot probability
+
+If you are not sure whether a target uses these techniques, attempt the registration with the Protocol Engine first. A high rate of 403 responses, redirects to CAPTCHA pages, or empty form submissions are indicators that browser-level execution is required.
+
+## Resource requirements and scaling
+
+The Browser Engine's resource profile is fundamentally different from the Protocol Engine's. Planning capacity correctly prevents worker instability.
+
+<Note>
+  Each concurrent Chromium instance consumes approximately 300–500 MB of RAM under normal load. On a worker with 16 GB of RAM allocated, a safe upper limit is 8 concurrent sessions, leaving headroom for the OS, the worker process, and memory spikes during page loads. Do not push concurrency to the theoretical maximum — a single OOM event can destabilize the entire worker.
+</Note>
+
+**CPU:** Each Chromium instance uses 1–2 CPU cores during active page interaction and JavaScript evaluation. A worker with 8 cores can sustain 5–6 concurrent sessions comfortably. Rendering-heavy pages (those with complex animations or large DOM trees) will spike CPU consumption temporarily.
+
+**Network:** Browser sessions generate more traffic per registration than Protocol Engine sessions because they fetch all page assets — scripts, stylesheets, images — in addition to the form submission itself. Ensure the worker's network interface can sustain the aggregate bandwidth of all concurrent sessions.
+
+**Scaling guidance:** Scale Browser Engine capacity by adding more worker nodes rather than increasing `concurrency` per worker beyond safe limits. This distributes memory pressure across machines and gives you better fault isolation — a misbehaving browser process on one worker does not affect sessions on other workers.
+
+<Tip>
+  Monitor `memory_usage_mb` per worker in the cluster dashboard. If a worker's memory climbs steadily over time, a browser context is likely leaking. Set `browser.max_session_age_seconds` to force context recycling and prevent long-running sessions from accumulating memory.
+</Tip>
+
+<Tip>
+  For targets where CAPTCHA solving is the bottleneck, check your solver service's average solve time. If solves take longer than 60 seconds on average, consider a faster solver provider or a higher-tier plan. A slow solver stalls the browser session and reduces effective throughput more than any other single factor.
+</Tip>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Protocol Engine" icon="bolt" href="/engines/protocol-engine">
+    The high-throughput HTTP engine for targets that do not require browser simulation.
+  </Card>
+  <Card title="Engine overview" icon="layers" href="/engines/overview">
+    Side-by-side comparison and guidance for choosing between the two engines.
+  </Card>
+  <Card title="Worker management" icon="server" href="/cluster/worker-management">
+    Deploying and configuring Browser Engine worker pools in the cluster.
+  </Card>
+  <Card title="Operations and monitoring" icon="chart-line" href="/operations/monitoring">
+    Tracking Browser Engine worker health, memory usage, and task success rates.
+  </Card>
+</CardGroup>

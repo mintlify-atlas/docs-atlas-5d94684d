@@ -1,0 +1,127 @@
+---
+title: "OpenAI CPA Architecture: Cluster, Engines, and Data Flow"
+description: "Deep dive into OpenAI CPA's system architecture: master node, worker nodes, dual-engine design, mail engine integration, and warehouse data flow."
+keywords: ["openai cpa architecture", "master node", "worker nodes", "protocol engine", "browser engine", "mail engine", "cpa warehouse", "sub2api"]
+---
+
+OpenAI CPA is organized as a distributed system with a clear separation between the control plane (the master node), the compute layer (worker nodes), the execution engines, the verification subsystem (Mail Engine), and the storage and delivery layer (warehouses). Understanding how these components relate to each other helps you make informed decisions about deployment topology, engine selection, and capacity planning.
+
+## System overview
+
+At the highest level, the platform forms a hub-and-spoke topology. A single master node sits at the center, maintaining the task queue and coordinating all workers. Worker nodes fan out from the master and do the actual registration work, each using one of two execution engines. The Mail Engine runs alongside workers to handle email verification. Completed accounts flow into the warehouse layer, where they are either managed through the CPA Warehouse or served via Sub2API to external consumers.
+
+The data path from task submission to account delivery looks like this:
+
+1. A task is submitted to the master node via its HTTP API.
+2. The master places the task in the appropriate priority queue and assigns it to an available worker.
+3. The worker executes the registration using the Protocol Engine or Browser Engine, depending on its configuration.
+4. If the registration requires email verification, the worker requests a verification code from the Mail Engine, which polls the assigned inbox and returns the code.
+5. The worker reports the completed account back to the master.
+6. The master stores the account in the CPA Warehouse.
+7. Downstream systems query Sub2API to consume accounts from the warehouse.
+
+## Master node
+
+The master node is the single control plane for the entire cluster. It performs four primary functions:
+
+- **Task scheduling**: Accepts task submissions via HTTP API, places them in priority queues, and dispatches them to workers as capacity becomes available. The scheduler enforces global concurrency limits and per-task retry policies.
+- **Worker coordination**: Maintains a registry of connected workers, tracks each worker's current load and engine type, and routes tasks only to workers that match the task's engine requirement.
+- **Health monitoring**: Periodically checks worker heartbeats. Workers that stop responding are marked unhealthy, and any tasks they were executing are re-queued for assignment to healthy workers.
+- **Result collection**: Receives completed account data from workers and persists it to the warehouse storage.
+
+The master exposes a single HTTP API surface that covers task submission, worker registration, health checks, and warehouse queries. All worker-to-master communication goes through this API.
+
+<Note>
+  The master node is a single point of coordination, not a single point of failure for registrations in progress. Workers that lose connectivity to the master continue executing their current tasks and attempt reconnection. Tasks are only re-queued if the worker's heartbeat times out.
+</Note>
+
+## Worker nodes
+
+Worker nodes are stateless compute units. Each worker connects to the master at startup, registers its identity and engine type, and enters a polling loop: request a task, execute it, report the result, repeat.
+
+Workers are purpose-configured for one engine type. A worker running the Protocol Engine will only receive Protocol Engine tasks; a worker running the Browser Engine will only receive Browser Engine tasks. This makes scaling engine-specific capacity straightforward — you add more workers of the appropriate type.
+
+Each worker manages its own concurrency internally. The `concurrency` setting in the worker config controls how many registrations the worker runs in parallel. The master's scheduler respects the aggregate capacity across all workers when dispatching tasks.
+
+## Dual-engine design
+
+The execution engine is the component inside a worker that performs the actual registration steps. OpenAI CPA ships two engines with fundamentally different approaches.
+
+<Tabs>
+  <Tab title="Protocol Engine">
+    The Protocol Engine operates at the HTTP/protocol layer. It constructs and sends raw HTTP requests, parses responses, and navigates the registration flow entirely without a browser. There is no DOM rendering, no JavaScript execution, and no browser process overhead.
+
+    **Strengths:**
+    - Maximum throughput per worker — concurrency in the dozens to hundreds is achievable on modest hardware
+    - Low memory footprint — no browser processes means more concurrent tasks per machine
+    - Predictable latency — no rendering pipeline means response times are driven purely by network round trips
+
+    **Limitations:**
+    - Cannot execute JavaScript challenges or solve browser fingerprint checks
+    - Ineffective against targets that detect non-browser TLS fingerprints or HTTP/2 fingerprints
+
+    **When to use it:**
+    Use the Protocol Engine for registration targets that do not perform client-side bot detection. If a target's registration flow works correctly when scripted with a plain HTTP client, the Protocol Engine is the right choice.
+  </Tab>
+  <Tab title="Browser Engine">
+    The Browser Engine runs full anti-detection Chromium-based browser sessions. Each registration task gets its own browser context with randomized fingerprints — canvas signatures, WebGL parameters, user-agent strings, screen dimensions, and timing characteristics are all varied to avoid detection.
+
+    **Strengths:**
+    - Passes browser fingerprint checks, canvas challenges, and JavaScript-based bot detection
+    - Supports targets that require real browser behavior (mouse movement patterns, scroll events, timing)
+    - Fingerprint rotation between sessions reduces the risk of cluster-wide detection events
+
+    **Limitations:**
+    - Higher memory and CPU consumption — each Chromium instance uses 300–500 MB of RAM
+    - Lower concurrency per worker compared to the Protocol Engine
+    - Longer task execution times due to page rendering
+
+    **When to use it:**
+    Use the Browser Engine when the target employs client-side fingerprinting, JavaScript challenges, or any detection mechanism that requires a real browser environment to bypass.
+  </Tab>
+</Tabs>
+
+Both engines can operate simultaneously within the same cluster by assigning different workers to each engine type. A common pattern is to run Protocol Engine workers for straightforward targets and Browser Engine workers for hardened ones, submitting tasks with the appropriate `engine` field to direct them to the right pool.
+
+## Mail Engine integration
+
+The Mail Engine is the verification subsystem that handles email-based confirmation steps in registration flows. Most registration targets send a verification code to the email address provided during signup. Without automation at this step, the registration pipeline stalls waiting for a human to retrieve and enter the code.
+
+The Mail Engine solves this by maintaining persistent connections to configured email inboxes and exposing a code-lookup interface to workers. When a worker reaches the email verification step, it calls the Mail Engine with the target email address and waits for a matching code to arrive. The Mail Engine polls the inbox at a configurable interval (typically every 5–10 seconds), extracts codes using pattern matching, and returns the result to the waiting worker.
+
+The Mail Engine supports multiple providers simultaneously. You can configure a pool of IMAP accounts or custom API-based mail providers, and the system distributes lookups across them. This prevents any single inbox from becoming a bottleneck at high registration volumes.
+
+See [Mail Engine overview](/mail/overview) and [Mail providers](/mail/providers) for configuration details.
+
+## Warehouse layer
+
+The warehouse layer is the output side of the platform — where completed accounts are stored and made available.
+
+### CPA Warehouse
+
+The CPA Warehouse is the primary account inventory. Every account successfully registered by a worker is written to the warehouse with its credentials, registration metadata, and status. The warehouse is designed for CPA and affiliate management workflows: you can query accounts by target, registration date, status, and task ID.
+
+The CPA Warehouse is queryable directly through the master's API, making it straightforward to export accounts to external systems or inspect inventory levels. See [CPA Warehouse](/warehouses/cpa-warehouse) for schema and query details.
+
+### Sub2API
+
+Sub2API is a read-oriented HTTP API layer on top of the CPA Warehouse. It is designed for downstream consumers — affiliate trackers, reseller panels, or any system that needs to retrieve accounts on demand without direct access to the warehouse internals.
+
+Sub2API supports filtering by account status, target, quantity, and registration date range. Accounts can be marked as consumed after retrieval, preventing duplicate delivery. See [Sub2API](/warehouses/sub2api) for the full endpoint reference.
+
+## Component map
+
+<CardGroup cols={2}>
+  <Card title="Core engines" icon="engine" href="/engines/overview">
+    Full reference for the Protocol Engine and Browser Engine, including configuration options and performance tuning.
+  </Card>
+  <Card title="Cluster and workers" icon="server" href="/cluster/overview">
+    How to deploy and scale the cluster, manage worker pools, and configure scheduling policies.
+  </Card>
+  <Card title="Mail Engine" icon="envelope" href="/mail/overview">
+    Mail Engine architecture, provider configuration, and code extraction patterns.
+  </Card>
+  <Card title="Warehouses and APIs" icon="database" href="/warehouses/cpa-warehouse">
+    CPA Warehouse schema, Sub2API endpoints, and integration patterns for downstream systems.
+  </Card>
+</CardGroup>

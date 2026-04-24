@@ -1,0 +1,99 @@
+---
+title: "OpenAI CPA: High-Scale Account Registration Platform"
+description: "Learn what OpenAI CPA is, how its dual-engine architecture works, and which problems it solves for high-scale account registration workflows."
+keywords: ["openai cpa", "distributed automation", "account registration", "protocol engine", "browser engine", "cluster", "mail engine"]
+---
+
+OpenAI CPA is a distributed automation platform designed for operators running high-scale account registration workflows. It removes the operational ceiling that single-server tools impose by distributing work across a cluster of workers, providing two interchangeable execution engines, automating email verification, and delivering completed accounts into structured warehouses ready for downstream consumption.
+
+## What OpenAI CPA does
+
+At its core, OpenAI CPA accepts registration tasks, executes them across a pool of worker nodes, and stores the resulting accounts for retrieval. Every component — from task dispatch to inbox polling to account delivery — is built to run concurrently and at scale.
+
+The platform has 935 GitHub stars and is licensed under **CC BY-NC 4.0**, which permits non-commercial use. Commercial use requires explicit written permission from the author.
+
+<Note>
+  OpenAI CPA is licensed under CC BY-NC 4.0. You may use, adapt, and redistribute it for non-commercial purposes. Contact the author for commercial licensing.
+</Note>
+
+## Dual-engine architecture
+
+The most significant design decision in OpenAI CPA is its dual-engine approach. Rather than committing every registration to one execution method, the platform gives you two distinct engines that you can assign per worker pool based on the target's characteristics.
+
+<Tabs>
+  <Tab title="Protocol Engine">
+    The Protocol Engine communicates directly at the HTTP/protocol layer without rendering a browser. It achieves maximum throughput by stripping out the overhead of a full browser environment.
+
+    Use the Protocol Engine when:
+    - The registration target does not employ browser-fingerprint detection
+    - You need the highest possible concurrency per worker
+    - Latency and raw request rate are the primary constraints
+  </Tab>
+  <Tab title="Browser Engine">
+    The Browser Engine runs anti-detection Chromium-based browsing sessions. It emulates a realistic browser environment — including fingerprint randomization and human-like interaction timing — to bypass bot detection systems.
+
+    Use the Browser Engine when:
+    - The target performs browser fingerprint or canvas checks
+    - JavaScript challenges or CAPTCHAs require a real rendering environment
+    - Stealth and authenticity take priority over raw throughput
+  </Tab>
+</Tabs>
+
+Both engines coexist within the same cluster. You can dedicate some workers to the Protocol Engine and others to the Browser Engine, mixing strategies across different registration targets simultaneously.
+
+## Key components
+
+OpenAI CPA is composed of four major subsystems that work together to take a task from submission to account delivery.
+
+<AccordionGroup>
+  <Accordion title="Cluster (master and worker nodes)" icon="server" defaultOpen={true}>
+    A single **master node** acts as the control plane. It maintains the task queue, enforces scheduling policies (concurrency limits, retry rules, priority queues), and monitors worker health. **Worker nodes** connect to the master, pull assigned tasks, execute registrations using their configured engine, and report results back. You scale throughput by adding more workers — the master handles coordination automatically.
+  </Accordion>
+  <Accordion title="Mail Engine" icon="envelope">
+    Most registration flows require email verification. The Mail Engine polls one or more email inboxes using configurable providers (IMAP and custom API providers are supported), extracts verification codes from incoming messages, and feeds those codes back into the active registration task. This happens automatically without manual intervention.
+  </Accordion>
+  <Accordion title="CPA Warehouse" icon="database">
+    The CPA Warehouse is the primary storage layer for completed registered accounts. It organizes accounts for affiliate and CPA management workflows, recording credentials and metadata for each successful registration. You can browse, export, and manage the inventory directly from the warehouse.
+  </Accordion>
+  <Accordion title="Sub2API" icon="plug">
+    Sub2API exposes the accounts stored in the warehouse via an HTTP API. Downstream systems — affiliate trackers, reseller panels, or custom integrations — query Sub2API to consume accounts on demand. This decouples account production from account consumption.
+  </Accordion>
+</AccordionGroup>
+
+## Who it's for
+
+OpenAI CPA is built for technical operators who need to run account registration at volumes that outpace what a single machine or naive scripting approach can handle. Typical use cases include:
+
+- **CPA and affiliate operators** who need a continuous supply of registered accounts across multiple platforms
+- **Infrastructure engineers** building internal tooling that requires automated account provisioning at scale
+- **Researchers and developers** studying registration flows, anti-detection techniques, or distributed task orchestration in a non-commercial context
+
+The platform assumes you are comfortable deploying server infrastructure, configuring network services, and working with YAML-based configuration files.
+
+## What problems it solves
+
+<AccordionGroup>
+  <Accordion title="Scale limits of single-machine approaches">
+    Running registration scripts on one machine caps your throughput at the resources of that machine. OpenAI CPA's cluster model lets you add worker nodes horizontally — throughput grows with your fleet, not with a single server's CPU or network bandwidth.
+  </Accordion>
+  <Accordion title="Bot detection on hardened targets">
+    Protocol-level scripts are blocked by targets that check browser fingerprints or run JavaScript challenges. The Browser Engine provides an anti-detection Chromium layer that passes these checks, while the Protocol Engine handles targets that do not require it — so you are not paying the performance cost of a browser where it is unnecessary.
+  </Accordion>
+  <Accordion title="Manual email verification bottlenecks">
+    Verification code entry is the most common point of failure and delay in automated registration. The Mail Engine handles inbox polling and code extraction automatically, keeping the registration pipeline unblocked even when hundreds of verifications are in flight simultaneously.
+  </Accordion>
+  <Accordion title="Fragmented account storage and delivery">
+    Completed accounts often end up scattered across log files or ad-hoc databases. The CPA Warehouse centralizes account storage, and Sub2API provides a clean HTTP interface so consuming systems always know where to fetch accounts.
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Deploy your master node, register your first worker, and run a registration task end-to-end in a single guide.
+  </Card>
+  <Card title="Architecture overview" icon="diagram-project" href="/architecture">
+    Understand the full system topology — how the master, workers, engines, mail engine, and warehouses connect and interact.
+  </Card>
+</CardGroup>

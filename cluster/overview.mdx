@@ -1,0 +1,66 @@
+---
+title: "Cluster Architecture: Master Node and Worker Topology"
+description: "Understand how OpenAI CPA's master-worker cluster topology coordinates task dispatch, worker registration, health checks, and horizontal scaling."
+keywords: ["cluster architecture", "master node", "worker nodes", "horizontal scaling", "health checks", "cluster topology", "openai cpa cluster"]
+---
+
+OpenAI CPA runs as a distributed cluster built around a single master node that coordinates a pool of worker nodes. The master owns the task queue, dispatches work to available workers, and monitors the health of every node in the cluster. Workers are stateless executors — they connect to the master at startup, pull tasks matched to their engine type, run those tasks, and report results back. This separation of concerns means you can scale throughput by adding worker nodes without touching the master or changing how tasks are submitted.
+
+## How the cluster is organized
+
+The cluster follows a hub-and-spoke topology. The master node sits at the center and is the only component that external systems interact with directly — task submissions, result queries, and warehouse access all go through the master's HTTP API. Worker nodes connect outward from the master and have no direct relationship with each other; all coordination flows through the master.
+
+When a worker starts up, it sends a registration request to the master that includes its engine type (Protocol or Browser), its configured concurrency limit, its proxy pool reference, and any labels you have assigned to it. The master records this information and begins routing tasks to the worker as matching work arrives in the queue.
+
+## Worker registration and availability
+
+Workers connect to the master over HTTP and maintain the connection through periodic heartbeat messages. The registration handshake provides the master with everything it needs to route tasks correctly:
+
+- **Engine type**: whether the worker runs the Protocol Engine or Browser Engine
+- **Concurrency limit**: the maximum number of tasks the worker can execute simultaneously
+- **Labels**: optional tags that allow fine-grained task routing to specific worker pools
+- **Proxy pool reference**: the proxy configuration the worker will use for outbound requests
+
+Once registered, the worker enters the task polling loop. It requests tasks from the master, and the master dispatches tasks whose engine type and label requirements match the worker's capabilities. If no matching tasks are queued, the worker waits and polls again at a configurable interval.
+
+<Note>
+  Workers that cannot reach the master at startup will retry the registration request with exponential backoff. In-flight tasks on a worker that temporarily loses connectivity to the master continue running — the worker buffers its results and delivers them when the connection is restored.
+</Note>
+
+## Health monitoring
+
+The master checks every registered worker's health by monitoring heartbeat timestamps. Each worker sends a heartbeat at a regular interval while it is idle or running tasks. If a worker misses a configurable number of consecutive heartbeats, the master marks it unhealthy and removes it from the dispatch pool.
+
+When a worker is marked unhealthy, any tasks that were dispatched to it but not yet confirmed complete are returned to the queue and reassigned to other available workers. This ensures that heartbeat timeouts do not result in silently dropped tasks.
+
+Healthy workers that you want to remove deliberately — for maintenance, reconfiguration, or capacity reduction — should be drained gracefully rather than terminated abruptly. See [Worker management](/cluster/worker-management) for the drain procedure.
+
+## Horizontal scaling
+
+You scale the cluster's throughput by adding more worker nodes. Each additional worker increases the pool of concurrency available to the master's scheduler without any reconfiguration of the master itself. To double your Protocol Engine throughput, deploy twice as many Protocol Engine workers. To handle more Browser Engine workloads, add Browser Engine workers to the cluster.
+
+Workers of different engine types can coexist in the same cluster. A common production topology runs dedicated Protocol Engine worker pools for high-volume straightforward targets alongside smaller Browser Engine worker pools for hardened targets. The master routes tasks to the correct pool automatically based on the task's engine field and any label selectors you configure.
+
+<Info>
+  There is no hard limit on the number of workers that can connect to a single master node. In practice, the master's capacity to dispatch tasks is bounded by its host machine's CPU and network throughput. For very large clusters, run the master on a high-network-throughput instance and monitor its dispatch latency.
+</Info>
+
+## Cluster components at a glance
+
+| Component | Role | Stateful? |
+|---|---|---|
+| **Master node** | Task queue, dispatch, health tracking, result storage | Yes — owns the task queue and warehouse |
+| **Worker node** | Task execution via Protocol or Browser Engine | No — stateless; results sent back to master |
+| **Task queue** | Priority-ordered work backlog managed by master | Yes — persisted on master |
+| **Dead letter queue** | Failed tasks exceeding max retries | Yes — managed on master |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Worker management" icon="server" href="/cluster/worker-management">
+    How to add workers, configure engine type and concurrency, monitor node status, and drain workers for maintenance.
+  </Card>
+  <Card title="Task scheduling" icon="list-ordered" href="/cluster/scheduling">
+    Priority queues, task routing via labels, retry policies, dead letter queue handling, and task status lifecycle.
+  </Card>
+</CardGroup>

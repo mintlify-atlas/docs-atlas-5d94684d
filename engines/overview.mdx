@@ -1,0 +1,84 @@
+---
+title: "Dual-Engine Overview: Protocol vs Browser Engine"
+description: "Compare OpenAI CPA's Protocol Engine and Browser Engine side by side. Learn how each engine works and when to choose one over the other."
+keywords: ["protocol engine", "browser engine", "dual-engine", "engine comparison", "engine selection", "openai cpa engines"]
+---
+
+OpenAI CPA ships two execution engines with fundamentally different approaches to registration automation. The Protocol Engine sends raw HTTP requests at maximum speed with minimal resource overhead. The Browser Engine runs anti-detection Chromium sessions that pass fingerprint checks and JavaScript challenges. Because both engines operate within the same cluster simultaneously, you are never forced to choose one globally — you assign engines per worker pool and route tasks to the appropriate pool based on each target's characteristics.
+
+## How the dual-engine system works
+
+Each worker node is configured for exactly one engine type. When the master node dispatches a task, it routes it to a worker whose engine type matches the task's `engine` field. This keeps engine selection a per-task decision rather than a cluster-wide commitment.
+
+A common deployment runs two worker pools side by side: a Protocol Engine pool handling targets with straightforward registration forms, and a Browser Engine pool reserved for targets that require full browser simulation. Tasks flow into both pools concurrently, and each pool scales independently based on your throughput and resource requirements.
+
+## Engine comparison
+
+| Characteristic | Protocol Engine | Browser Engine |
+|---|---|---|
+| **Execution method** | Raw HTTP requests, no rendering | Anti-detection Chromium browser |
+| **Speed** | Very high — hundreds of concurrent tasks per worker | Moderate — browser startup and rendering add latency |
+| **Resource usage per worker** | Low — no browser process overhead | High — 300–500 MB RAM per Chromium instance |
+| **Bot detection resistance** | Basic — header and fingerprint spoofing only | High — full fingerprint randomization, JS execution |
+| **JavaScript challenges** | Not supported | Supported |
+| **CAPTCHA handling** | Not supported | Supported via solver integration |
+| **Ideal concurrency per worker** | Dozens to hundreds | 3–10 simultaneous browser instances |
+| **Best for** | Targets without advanced bot detection | Targets with fingerprinting, JS challenges, CAPTCHAs |
+
+## Choosing an engine
+
+The right engine for a given target depends on what that target checks during registration. Use the following decision criteria.
+
+<Tabs>
+  <Tab title="Use the Protocol Engine when">
+    - The target's registration form submits data via standard HTTP POST requests with no JavaScript validation on the server's end
+    - You have verified the target does not perform browser fingerprint checks, canvas challenges, or TLS fingerprint inspection
+    - You need maximum concurrency per worker and have limited hardware resources
+    - Raw registration throughput is the primary constraint and detection risk is low
+
+    The Protocol Engine is the default choice for straightforward targets. It delivers the highest registrations-per-second rate at the lowest infrastructure cost.
+  </Tab>
+  <Tab title="Use the Browser Engine when">
+    - The target uses Cloudflare Bot Management, reCAPTCHA, hCaptcha, or similar detection systems
+    - Registration requires JavaScript execution to render the form or submit data
+    - The target performs canvas fingerprinting, WebGL checks, or user-agent validation beyond simple string matching
+    - Human-like mouse movements or typing delays are required to pass behavioral analysis
+
+    The Browser Engine has a higher per-task cost in CPU and RAM, but it is the only option for hardened targets where the Protocol Engine would be blocked or flagged.
+  </Tab>
+  <Tab title="Running both simultaneously">
+    - Assign some worker nodes to the Protocol Engine and others to the Browser Engine in your cluster configuration
+    - Submit tasks with the appropriate `engine` field (`"protocol"` or `"browser"`) to direct them to the correct pool
+    - Scale each pool independently — add Protocol Engine workers for volume, add Browser Engine workers for hardened targets
+    - Monitor task failure rates per pool to detect when a target has tightened its detection and needs engine reassignment
+  </Tab>
+</Tabs>
+
+<Note>
+  If you are unsure which engine a new target requires, start with the Protocol Engine. If you see high failure rates or blocked sessions, switch that target's tasks to the Browser Engine.
+</Note>
+
+## Engine capabilities at a glance
+
+<AccordionGroup>
+  <Accordion title="What the Protocol Engine can handle">
+    The Protocol Engine handles any registration flow that does not require client-side JavaScript execution or browser fingerprint validation. It manages HTTP session state, cookies, header composition, and request fingerprinting. It supports proxy pool assignment and per-request retry logic. It is well-suited to platforms built on standard web frameworks where the registration endpoint accepts plain HTTP form submissions or JSON payloads.
+  </Accordion>
+  <Accordion title="What the Browser Engine can handle">
+    The Browser Engine executes the full browser lifecycle for each registration session. It randomizes browser fingerprints between sessions, simulates realistic mouse movement paths and typing cadence, evaluates JavaScript on the page, and supports CAPTCHA solver integration. It can navigate multi-step registration flows that rely on client-side state, single-page application rendering, or behavioral analysis checkpoints.
+  </Accordion>
+  <Accordion title="What neither engine handles automatically">
+    Some targets implement SMS-based verification instead of or in addition to email verification. Neither engine solves SMS verification natively — you need to integrate an SMS provider through your task configuration. Similarly, image-based CAPTCHA types not supported by your configured solver service will require manual intervention or a different solver integration.
+  </Accordion>
+</AccordionGroup>
+
+## Dive deeper
+
+<CardGroup cols={2}>
+  <Card title="Protocol Engine" icon="bolt" href="/engines/protocol-engine">
+    Configuration reference, performance tuning tips, and example YAML for the HTTP-level execution engine.
+  </Card>
+  <Card title="Browser Engine" icon="browser" href="/engines/browser-engine">
+    Anti-detection features, fingerprint profile configuration, CAPTCHA integration, and resource scaling guidance for the Chromium-based engine.
+  </Card>
+</CardGroup>

@@ -1,0 +1,80 @@
+---
+title: 'Mail Engine: Automated Email Verification for Registrations'
+description: "Learn how OpenAI CPA's Mail Engine polls inboxes, extracts verification codes, and integrates with worker tasks during registration flows."
+keywords: ['mail engine', 'inbox polling', 'verification codes', 'registration', 'CPA']
+---
+
+The Mail Engine is the component responsible for automating email-based verification during account registration flows. When a worker task reaches a step that requires a verification code — such as confirming a new account via email — it hands off control to the Mail Engine, which polls the assigned inbox, extracts the code using configured regex patterns, and returns it to the worker so registration can continue. This design keeps verification logic centralized and reusable across all worker types, rather than embedding inbox-handling code in individual task scripts.
+
+## How inbox polling works
+
+Each time a worker requests a verification code, the Mail Engine begins a polling cycle against the inbox associated with that task. On every cycle, it connects to the provider (via IMAP or a custom HTTP API), fetches recent messages, and applies regex patterns to identify a message containing the expected code. If a match is found, the code is extracted and returned immediately. If no match is found within the configured timeout, the engine retries up to the maximum retry count before failing the step.
+
+The polling cycle is intentionally short — typically a few seconds — to minimize registration latency while respecting provider rate limits. Providers are pooled, and the engine automatically routes each request to the least-loaded provider to distribute connection load.
+
+## Integration with worker tasks
+
+Workers do not manage inbox connections directly. Instead, a worker that needs a verification code calls the Mail Engine via an internal task interface, passing the target inbox identifier and any context needed to scope the search (such as the expected sender domain or subject prefix). The Mail Engine handles the rest and returns only the extracted code string.
+
+<Note>
+  The Mail Engine runs as a shared service. Multiple workers can request verification codes concurrently, and the engine queues and routes each request independently.
+</Note>
+
+## Key capabilities
+
+<CardGroup cols={2}>
+  <Card title="IMAP and API providers" icon="inbox" href="/mail/providers">
+    Connect standard IMAP mailboxes or custom HTTP API-based email services. Providers are pooled for load distribution.
+  </Card>
+  <Card title="Configurable polling behavior" icon="sliders" href="/mail/configuration">
+    Set poll intervals, inbox timeouts, regex extraction patterns, and retry limits to match your provider and registration flow.
+  </Card>
+  <Card title="Worker integration" icon="cpu" href="/cluster/worker-management">
+    Workers call the Mail Engine during task execution. No inbox logic lives in individual worker scripts.
+  </Card>
+  <Card title="Cluster scheduling" icon="network" href="/cluster/scheduling">
+    The Mail Engine participates in the cluster scheduling model, with provider connections managed alongside other shared resources.
+  </Card>
+</CardGroup>
+
+## Polling cycle
+
+The following sequence describes a single end-to-end verification code retrieval:
+
+<Steps>
+  <Step title="Worker requests a code">
+    A worker task reaches a registration step requiring email verification and calls the Mail Engine with the target inbox identifier.
+  </Step>
+  <Step title="Provider is selected">
+    The Mail Engine checks the provider pool and selects the least-loaded provider capable of accessing the target inbox.
+  </Step>
+  <Step title="Inbox is polled">
+    The engine connects to the inbox and retrieves recent messages. For IMAP providers this uses an authenticated IMAP session; for API providers it issues an HTTP request.
+  </Step>
+  <Step title="Regex extraction runs">
+    Each retrieved message is tested against the configured verification code regex patterns. The first match is used.
+  </Step>
+  <Step title="Code is returned">
+    The extracted code is returned to the calling worker task, which uses it to complete the registration step.
+  </Step>
+  <Step title="Retry on no match">
+    If no code is found, the engine waits for the configured poll interval and retries. After reaching the max retry count, the step is marked as failed.
+  </Step>
+</Steps>
+
+## Common questions
+
+<AccordionGroup>
+  <Accordion title="Can the Mail Engine handle multiple inboxes at once?">
+    Yes. The engine processes verification requests concurrently and maintains separate polling state for each active request. Provider pooling ensures that connection limits are respected even under high concurrency.
+  </Accordion>
+  <Accordion title="What happens if the verification email never arrives?">
+    The engine retries polling up to the configured `max_retries` count, waiting `poll_interval` seconds between each attempt. Once retries are exhausted, the Mail Engine returns a timeout error to the worker, which can then escalate or retry the full registration task.
+  </Accordion>
+  <Accordion title="Does the Mail Engine delete emails after reading them?">
+    By default, emails are not deleted. Deletion behavior is provider-specific and can be configured per provider. See the [providers reference](/mail/providers) for details.
+  </Accordion>
+  <Accordion title="How does the engine relate to the Protocol Engine?">
+    The Mail Engine is a supporting service used during registration. The [Protocol Engine](/engines/protocol-engine) handles the higher-level registration flow logic and calls the Mail Engine when a verification step is encountered.
+  </Accordion>
+</AccordionGroup>

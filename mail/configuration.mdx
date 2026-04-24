@@ -1,0 +1,119 @@
+---
+title: 'Configure the Mail Engine: Polling, Patterns, and Timeouts'
+description: 'Configure poll interval, inbox timeout, verification code regex patterns, and max retries so workers receive codes reliably during registration.'
+keywords: ['mail engine config', 'poll interval', 'inbox timeout', 'regex', 'verification code', 'max retries']
+---
+
+The Mail Engine is configured through a dedicated section of your cluster configuration file. These settings control how aggressively the engine polls for new messages, how long it waits before giving up, and which regex patterns it uses to extract verification codes from email bodies. Getting these values right for your provider and registration flow is the most important tuning step before going to production.
+
+## Configuration reference
+
+<AccordionGroup>
+  <Accordion title="poll_interval" defaultOpen={true}>
+    How often (in seconds) the Mail Engine re-checks an inbox when a code has not yet been found. Lower values reduce verification latency but increase load on the email provider. Recommended range: `3`–`10` seconds.
+  </Accordion>
+  <Accordion title="inbox_timeout">
+    Maximum total time (in seconds) the engine waits for a verification code before failing the step. This value must be greater than `poll_interval * max_retries`. Recommended: `120`–`300` seconds depending on provider delivery speed.
+  </Accordion>
+  <Accordion title="max_retries">
+    Maximum number of polling attempts before the engine gives up and returns a timeout error to the calling worker. The engine stops whichever limit is hit first: `max_retries` or `inbox_timeout`.
+  </Accordion>
+  <Accordion title="code_patterns">
+    A list of regex patterns applied to each email message body. Patterns are tested in order; the first capture group of the first matching pattern is used as the extracted code. Provide at least one pattern. Use named capture groups for clarity.
+  </Accordion>
+  <Accordion title="delete_after_read">
+    Boolean. When `true`, the engine marks the matched email as deleted (IMAP) or calls the provider's delete endpoint (HTTP API) after successfully extracting a code. Defaults to `false`.
+  </Accordion>
+</AccordionGroup>
+
+## Example configuration
+
+The Mail Engine configuration lives under the `mail_engine` key in your main cluster config file.
+
+```yaml cluster.yaml
+mail_engine:
+  poll_interval: 5          # seconds between inbox checks
+  inbox_timeout: 180        # seconds before failing a verification request
+  max_retries: 35           # maximum polling attempts
+  delete_after_read: false  # leave emails in inbox after extraction
+
+  code_patterns:
+    - '(?P<code>\b\d{6}\b)'                          # 6-digit numeric code
+    - 'verification code[:\s]+(?P<code>[A-Z0-9]{8})' # 8-char alphanumeric
+    - 'Your code is\s+(?P<code>\d{4,8})'             # prose with 4–8 digits
+
+  providers:
+    - name: primary-imap
+      type: imap
+      host: mail.example.com
+      port: 993
+      tls: true
+      pool_size: 10
+
+    - name: api-provider-1
+      type: http_api
+      base_url: https://api.mailservice.example/v1
+      api_key: "${MAIL_API_KEY}"
+      pool_size: 5
+```
+
+<Warning>
+  `inbox_timeout` should always be at least `poll_interval * max_retries`. If it is shorter, the engine may stop due to timeout before exhausting its retry count, making `max_retries` effectively irrelevant.
+</Warning>
+
+<Tip>
+  Order your `code_patterns` from most specific to least specific. The engine tests patterns in list order and uses the first match. Overly broad patterns at the top can cause false positives on non-verification emails.
+</Tip>
+
+## Setup steps
+
+<Steps>
+  <Step title="Add the mail_engine block to your cluster config">
+    Open your `cluster.yaml` and add a `mail_engine` top-level key. Copy the example above as a starting point and adjust values to match your environment.
+  </Step>
+  <Step title="Configure at least one provider">
+    Add one or more entries under `mail_engine.providers`. Each provider must have a unique `name`, a `type` of either `imap` or `http_api`, and the relevant connection details. See [providers](/mail/providers) for full per-type options.
+  </Step>
+  <Step title="Set your regex patterns">
+    Add at least one entry to `code_patterns`. Test your patterns against real sample emails from your target services before deploying. Use an online regex tester with your actual email bodies.
+  </Step>
+  <Step title="Tune poll_interval and max_retries">
+    Start with `poll_interval: 5` and `max_retries: 30` (150 seconds total). Adjust based on measured delivery times from your email providers. Check [operations monitoring](/operations/monitoring) to track average extraction latency.
+  </Step>
+  <Step title="Restart the cluster to apply changes">
+    Configuration is read at startup. After editing `cluster.yaml`, restart the cluster or reload the Mail Engine service. Worker nodes will pick up the new settings on their next connection to the engine.
+  </Step>
+</Steps>
+
+## How workers reference the Mail Engine
+
+Workers do not connect to the Mail Engine directly through configuration — the connection is managed by the cluster runtime. When a worker task needs a verification code, it calls the Mail Engine through the internal task API:
+
+```python worker_task.py
+# Within a worker task script, request a verification code
+code = mail_engine.get_verification_code(
+    inbox_id="inbox-pool-a",      # which inbox pool to target
+    sender_domain="service.com",  # optional: scope search by sender
+    subject_prefix="Verify",      # optional: scope search by subject
+)
+```
+
+The `inbox_id` corresponds to a provider `name` defined in `cluster.yaml`. Workers reference providers by name; the engine handles routing, pooling, and retry logic transparently.
+
+<Note>
+  If a worker task does not specify an `inbox_id`, the Mail Engine selects from all available providers and picks the least-loaded one. Explicit `inbox_id` targeting is recommended when different providers hold different accounts.
+</Note>
+
+## Validating your configuration
+
+Use the cluster CLI to validate your Mail Engine config before deploying:
+
+```bash
+cpa-cluster validate --config cluster.yaml --section mail_engine
+```
+
+This checks that all required fields are present, that regex patterns compile without errors, and that provider connection details are structurally valid. It does not make live connections to providers — test those separately using the provider ping command:
+
+```bash
+cpa-cluster mail ping --provider primary-imap
+```

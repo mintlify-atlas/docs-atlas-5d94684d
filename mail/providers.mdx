@@ -1,0 +1,171 @@
+---
+title: 'Mail Engine Providers: IMAP and HTTP API Setup Guide'
+description: 'Set up IMAP and custom HTTP API email providers for the Mail Engine, configure provider pools, and add new providers to handle high verification volumes.'
+keywords: ['IMAP', 'email provider', 'HTTP API', 'provider pool', 'mail engine', 'smtp']
+---
+
+The Mail Engine supports two classes of email provider: standard IMAP-based mailboxes and custom HTTP API-based email services. IMAP providers cover the majority of traditional email hosting setups, while HTTP API providers accommodate specialist services — such as temporary inbox APIs or proprietary enterprise mail platforms — that expose a REST interface rather than a raw IMAP connection. Both types participate in the same provider pool, and the Mail Engine routes verification requests to whichever provider is least loaded at the time of the request.
+
+## Provider types
+
+<CardGroup cols={2}>
+  <Card title="IMAP providers" icon="server">
+    Connect to any IMAP-compatible mailbox over TLS. Suitable for Gmail, Outlook, Fastmail, and self-hosted mail servers. Credentials are a username and password or app-specific token.
+  </Card>
+  <Card title="HTTP API providers" icon="webhook">
+    Connect to services that expose inbox contents via a REST API. The Mail Engine calls a configurable endpoint to fetch messages and uses the response body as the message content for regex extraction.
+  </Card>
+</CardGroup>
+
+## Configuring providers
+
+<Tabs>
+  <Tab title="IMAP provider">
+    IMAP providers connect directly to an IMAP server using standard credentials. TLS is strongly recommended and should be enabled in all production environments.
+
+    ```yaml cluster.yaml
+    mail_engine:
+      providers:
+        - name: imap-primary
+          type: imap
+          host: mail.example.com
+          port: 993
+          tls: true
+          username: inbox-user@example.com
+          password: "${IMAP_PASSWORD}"
+          pool_size: 10
+          delete_after_read: false
+          mailbox: INBOX          # IMAP folder to poll (default: INBOX)
+          connection_timeout: 15  # seconds to wait for IMAP connection
+    ```
+
+    **Field reference:**
+
+    | Field | Required | Default | Description |
+    |---|---|---|---|
+    | `name` | Yes | — | Unique identifier for this provider. Referenced by workers. |
+    | `type` | Yes | — | Must be `imap`. |
+    | `host` | Yes | — | IMAP server hostname or IP. |
+    | `port` | Yes | — | Typically `993` for TLS, `143` for STARTTLS. |
+    | `tls` | No | `true` | Enable TLS. Set to `false` only for local testing. |
+    | `username` | Yes | — | IMAP account username. |
+    | `password` | Yes | — | Account password or app token. Use environment variable references. |
+    | `pool_size` | No | `5` | Number of concurrent IMAP sessions allowed for this provider. |
+    | `delete_after_read` | No | `false` | Delete matched email after code extraction. |
+    | `mailbox` | No | `INBOX` | IMAP folder to search. |
+    | `connection_timeout` | No | `15` | Seconds before abandoning a connection attempt. |
+
+    <Warning>
+      Never store passwords as plaintext in `cluster.yaml`. Use environment variable references (`"${VAR_NAME}"`) or a secrets manager integration. Committing credentials to version control is a security risk.
+    </Warning>
+
+    <Tip>
+      For Gmail accounts, generate an app-specific password under Google Account security settings. Standard account passwords are rejected when two-factor authentication is enabled.
+    </Tip>
+  </Tab>
+  <Tab title="HTTP API provider">
+    HTTP API providers work with email services that expose inbox contents through a REST endpoint. The Mail Engine issues a GET request to the configured `messages_endpoint`, parses the JSON response, and applies the extraction field path to get the message body for regex matching.
+
+    ```yaml cluster.yaml
+    mail_engine:
+      providers:
+        - name: tempmail-api
+          type: http_api
+          base_url: https://api.mailservice.example/v1
+          api_key: "${MAIL_API_KEY}"
+          pool_size: 5
+          delete_after_read: true
+
+          endpoints:
+            messages: "/inboxes/{inbox_id}/messages"  # GET endpoint for message list
+            message_body: "/messages/{message_id}"    # GET endpoint for single message
+
+          response_mapping:
+            messages_list_path: "data.messages"       # JSONPath to array of messages
+            message_id_field: "id"                    # field containing message ID
+            body_field: "body_text"                   # field containing message text
+    ```
+
+    **Field reference:**
+
+    | Field | Required | Default | Description |
+    |---|---|---|---|
+    | `name` | Yes | — | Unique identifier for this provider. |
+    | `type` | Yes | — | Must be `http_api`. |
+    | `base_url` | Yes | — | Base URL of the email service API. |
+    | `api_key` | Yes | — | API key for authentication. Use environment variable references. |
+    | `pool_size` | No | `5` | Maximum concurrent API requests for this provider. |
+    | `delete_after_read` | No | `false` | Call the provider's delete endpoint after extraction. |
+    | `endpoints.messages` | Yes | — | Path template for listing inbox messages. |
+    | `endpoints.message_body` | No | — | Path template for fetching a single message body. Omit if body is included in the list response. |
+    | `response_mapping.messages_list_path` | Yes | — | Dot-notation path to the array of messages in the API response. |
+    | `response_mapping.message_id_field` | Yes | — | Field name containing the unique message identifier. |
+    | `response_mapping.body_field` | Yes | — | Field name containing the message text to search for verification codes. |
+
+    <Note>
+      The Mail Engine substitutes `{inbox_id}` and `{message_id}` in endpoint path templates at request time. The `inbox_id` comes from the worker's `inbox_id` parameter when requesting a code.
+    </Note>
+  </Tab>
+</Tabs>
+
+## Provider pooling
+
+All configured providers participate in the same pool. When a worker requests a verification code, the Mail Engine checks the current load (active requests) on each provider and routes the request to the provider with the most available capacity. Providers that exceed their `pool_size` limit are skipped until a slot becomes free.
+
+```
+Worker A ──┐
+Worker B ──┤──► Mail Engine ──► [imap-primary: 8/10] ──► least-loaded selected
+Worker C ──┘                    [tempmail-api: 2/5 ] ◄──
+```
+
+<Tip>
+  If you have multiple IMAP providers holding different account pools, assign each a unique `name` and reference them explicitly from your worker tasks using `inbox_id`. This gives you precise control over which accounts are used for which registration tasks.
+</Tip>
+
+## Adding a new provider
+
+<Steps>
+  <Step title="Choose the provider type">
+    Determine whether your new email service exposes an IMAP interface or a REST API. If it supports both, prefer IMAP — the Mail Engine's IMAP implementation is more battle-tested and handles edge cases like partial delivery more reliably.
+  </Step>
+  <Step title="Add the provider block to cluster.yaml">
+    Add a new entry under `mail_engine.providers` with a unique `name` and all required fields for the chosen type. Use the configuration examples above as a template.
+  </Step>
+  <Step title="Store credentials securely">
+    Add the provider's password or API key as an environment variable on your cluster nodes. Reference it in `cluster.yaml` using `"${VAR_NAME}"` syntax. Do not hard-code secrets.
+  </Step>
+  <Step title="Validate the configuration">
+    Run the cluster config validator to catch any structural errors before restarting:
+
+    ```bash
+    cpa-cluster validate --config cluster.yaml --section mail_engine
+    ```
+  </Step>
+  <Step title="Test the provider connection">
+    Use the provider ping command to verify the Mail Engine can reach the new provider before routing live traffic to it:
+
+    ```bash
+    cpa-cluster mail ping --provider <name>
+    ```
+
+    A successful ping confirms connectivity and authentication. For IMAP providers it also verifies access to the configured mailbox folder.
+  </Step>
+  <Step title="Restart the Mail Engine">
+    Reload the Mail Engine to apply the new provider. New workers will immediately be eligible to use it. Existing in-flight verification requests continue using their originally assigned provider.
+  </Step>
+</Steps>
+
+## Supported provider integrations
+
+The following table summarizes tested provider types and their recommended configurations:
+
+| Provider type | Type | Recommended port | Notes |
+|---|---|---|---|
+| Standard IMAP server | `imap` | `993` (TLS) | Works with any RFC 3501-compliant server. |
+| Gmail | `imap` | `993` | Requires app-specific password if 2FA is enabled. |
+| Microsoft 365 / Outlook | `imap` | `993` | Requires OAuth2 or basic auth with legacy auth enabled. |
+| Fastmail | `imap` | `993` | Works with standard IMAP credentials. |
+| Custom temporary inbox API | `http_api` | — | Configure `endpoints` and `response_mapping` per service. |
+| Proprietary enterprise mail | `http_api` | — | Contact your mail service for API documentation. |
+
+For deployment and operational guidance, see [operations monitoring](/operations/monitoring) and [troubleshooting](/operations/troubleshooting).

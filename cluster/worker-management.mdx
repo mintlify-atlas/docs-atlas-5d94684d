@@ -1,0 +1,168 @@
+---
+title: "Manage Worker Nodes: Add, Configure, and Drain Workers"
+description: "Add worker nodes to your CPA cluster, configure engine type, concurrency, proxy pools, and labels, monitor worker status, and drain nodes for maintenance."
+keywords: ["worker nodes", "worker configuration", "concurrency", "proxy pool", "worker labels", "drain worker", "openai cpa workers"]
+---
+
+Workers are the execution layer of your CPA cluster. Each worker connects to the master node at startup, registers its capabilities, and enters a task polling loop where it accepts and runs work matched to its engine type and labels. Because workers are stateless, you can add or remove them at any time without affecting the master node or tasks that other workers are running.
+
+## Adding a worker node
+
+Follow these steps to bring a new worker online and join it to an existing cluster.
+
+<Steps>
+  <Step title="Install the CPA worker binary">
+    Install the CPA software on the host that will run the worker. The worker binary ships alongside the master in the same release archive. Follow the same installation steps you used for the master node — extract the archive and ensure the `cpa` command is on your `PATH`.
+
+    ```bash
+    # Verify the binary is available
+    cpa --version
+    ```
+  </Step>
+
+  <Step title="Create the worker configuration file">
+    Create a `worker.yaml` file on the host. At minimum you must specify the master address and engine type. The full set of options is described in the [configuration reference](#worker-configuration-options) below.
+
+    ```yaml
+    master_address: "http://master.internal:8080"
+    engine: protocol
+
+    concurrency: 8
+
+    proxy_pool:
+      provider: residential
+      region: us-east
+
+    labels:
+      environment: production
+      tier: standard
+
+    heartbeat_interval_seconds: 10
+    poll_interval_seconds: 2
+    ```
+  </Step>
+
+  <Step title="Start the worker process">
+    Pass the configuration file path to the worker start command. The worker immediately attempts to register with the master.
+
+    ```bash
+    cpa worker start --config worker.yaml
+    ```
+
+    On success, the master logs a registration event and the worker appears in the active worker list.
+  </Step>
+
+  <Step title="Verify the worker is registered">
+    Query the master's worker list endpoint to confirm the new worker has joined the cluster and is in the `available` state.
+
+    ```bash
+    cpa cluster workers list
+    ```
+
+    You should see the new worker's ID, engine type, concurrency limit, and current status.
+  </Step>
+</Steps>
+
+<Note>
+  If the worker cannot reach the master at startup, it retries registration with exponential backoff. Check that the master's HTTP port is reachable from the worker host and that no firewall rules block the connection.
+</Note>
+
+## Worker configuration options
+
+The table below covers every field you can set in `worker.yaml`. All fields except `master_address` and `engine` have defaults.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `master_address` | string | — | Required. Full URL of the master node's HTTP API. |
+| `engine` | string | — | Required. `protocol` or `browser`. |
+| `concurrency` | integer | `4` | Maximum number of tasks the worker runs simultaneously. |
+| `proxy_pool.provider` | string | `none` | Proxy provider: `residential`, `datacenter`, or `none`. |
+| `proxy_pool.region` | string | `any` | Geographic region for proxy selection. |
+| `labels` | map | `{}` | Arbitrary key-value pairs used for task routing. |
+| `heartbeat_interval_seconds` | integer | `10` | Frequency of heartbeat messages sent to the master. |
+| `poll_interval_seconds` | integer | `2` | How often the worker polls for new tasks when idle. |
+| `log_level` | string | `info` | Log verbosity: `debug`, `info`, `warn`, or `error`. |
+
+<Tip>
+  Set `concurrency` based on the worker host's available CPU and memory. Protocol Engine workers are CPU-light and tolerate higher concurrency — values of 16 to 32 are common on standard instances. Browser Engine workers are resource-heavy; keep concurrency at 2 to 4 per worker unless you are running dedicated high-memory hosts.
+</Tip>
+
+## Engine types
+
+Each worker runs exactly one engine type. Choose the engine that matches the targets your worker pool will handle.
+
+<Tabs>
+  <Tab title="Protocol Engine">
+    The Protocol Engine communicates directly with target APIs and web servers using HTTP, JSON, and structured protocols. It is fast, resource-efficient, and suitable for targets that do not require JavaScript rendering or browser fingerprinting.
+
+    Set `engine: protocol` in `worker.yaml`.
+
+    Protocol Engine workers are the default choice for high-volume, straightforward data extraction workloads.
+  </Tab>
+  <Tab title="Browser Engine">
+    The Browser Engine drives a headless browser to render pages, execute JavaScript, and simulate human interaction. Use it for targets that require JavaScript rendering, cookie-based sessions, or bot-detection bypass.
+
+    Set `engine: browser` in `worker.yaml`.
+
+    Browser Engine workers consume significantly more memory and CPU than Protocol Engine workers. Size your hosts accordingly and keep concurrency lower.
+  </Tab>
+</Tabs>
+
+See [Engines overview](/engines/overview) for a detailed comparison of both engines.
+
+## Monitoring worker status
+
+Use the CLI or the master's HTTP API to inspect the current state of every worker in the cluster.
+
+```bash
+# List all workers with status and task counts
+cpa cluster workers list
+
+# Show detailed info for a specific worker
+cpa cluster workers inspect <worker-id>
+```
+
+Worker status values you will see in the output:
+
+| Status | Meaning |
+|---|---|
+| `available` | Registered and polling for tasks. |
+| `busy` | Running at full concurrency; no capacity for new tasks. |
+| `draining` | Finishing in-flight tasks; not accepting new work. |
+| `unhealthy` | Missed heartbeat threshold; removed from dispatch pool. |
+| `offline` | Gracefully shut down or deregistered. |
+
+<Warning>
+  An `unhealthy` worker does not automatically recover. Any tasks that were dispatched to an unhealthy worker are returned to the queue and reassigned. Investigate the worker host's logs and network connectivity before restarting it.
+</Warning>
+
+## Graceful draining
+
+Drain a worker when you want to take it offline for maintenance or reconfiguration without dropping in-flight tasks. A draining worker finishes any tasks it is currently running, does not accept new work, and then exits cleanly.
+
+```bash
+cpa cluster workers drain <worker-id>
+```
+
+The master immediately stops dispatching tasks to a draining worker. Once all in-flight tasks complete, the worker deregisters itself and shuts down. You can monitor drain progress with `cpa cluster workers inspect <worker-id>` and watch the in-flight task count drop to zero.
+
+<Tip>
+  During a rolling upgrade of worker nodes, drain one worker at a time to keep cluster throughput stable. Wait for each worker to reach `offline` status before draining the next one.
+</Tip>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Cluster overview" icon="network" href="/cluster/overview">
+    Master-worker topology, health monitoring, and horizontal scaling concepts.
+  </Card>
+  <Card title="Task scheduling" icon="list-ordered" href="/cluster/scheduling">
+    Priority queues, task routing via labels, retry policies, and task status lifecycle.
+  </Card>
+  <Card title="Protocol Engine" icon="code" href="/engines/protocol-engine">
+    How the Protocol Engine handles structured API and HTTP targets.
+  </Card>
+  <Card title="Browser Engine" icon="globe" href="/engines/browser-engine">
+    How the Browser Engine renders pages and bypasses bot detection.
+  </Card>
+</CardGroup>

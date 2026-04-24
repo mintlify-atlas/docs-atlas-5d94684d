@@ -1,0 +1,161 @@
+---
+title: 'Deploy OpenAI CPA: Master Node and Worker Setup Guide'
+description: 'Step-by-step guide to deploying the OpenAI CPA master node and workers, configuring environment variables, and verifying cluster health before going live.'
+keywords: ['deployment', 'cluster', 'master node', 'workers', 'setup', 'CPA']
+---
+
+Deploying an OpenAI CPA cluster involves bringing up a master node first, then registering one or more worker nodes against it. The master coordinates all task scheduling and exposes the health and metrics endpoints, while workers execute tasks using either the Protocol Engine or Browser Engine. Getting the order of operations right — and matching your hardware to the workload — is the most important part of a smooth deployment.
+
+## System requirements
+
+Before deploying, make sure each machine meets the minimum hardware requirements for its role.
+
+<CardGroup cols={3}>
+  <Card title="Master node" icon="server">
+    2+ CPU cores and 4 GB+ RAM. Handles scheduling, state management, and API exposure. Does not execute tasks directly.
+  </Card>
+  <Card title="Protocol Engine worker" icon="bolt">
+    1 GB RAM per worker. Lightweight HTTP-based task execution with no browser overhead.
+  </Card>
+  <Card title="Browser Engine worker" icon="globe">
+    4 GB+ RAM per worker. Runs full Chromium instances for JavaScript-heavy sites and fingerprint-resistant browsing.
+  </Card>
+</CardGroup>
+
+<Note>
+  Browser Engine workers require significantly more RAM than Protocol Engine workers because each worker spawns a dedicated Chromium process. Plan your capacity accordingly — running more workers than your RAM supports will cause OOM failures under load.
+</Note>
+
+## Deployment steps
+
+Deploy in this order: master first, workers second. Workers cannot register until the master is reachable.
+
+<Steps>
+  <Step title="Prepare your environment file">
+    Create a `.env` file (or copy from the provided template) on each machine. Set values specific to that machine's role.
+
+    ```bash
+    cp .env.example .env
+    nano .env
+    ```
+
+    The minimal master configuration:
+
+    ```ini master .env
+    NODE_ROLE=master
+    MASTER_HOST=0.0.0.0
+    MASTER_PORT=4000
+    LOG_LEVEL=info
+    LOG_PATH=/var/log/cpa/master.log
+    DB_URL=postgres://user:pass@localhost:5432/cpa
+    ```
+
+    The minimal worker configuration:
+
+    ```ini worker .env
+    NODE_ROLE=worker
+    MASTER_ADDRESS=http://<master-ip>:4000
+    ENGINE_TYPE=protocol        # or: browser
+    WORKER_CONCURRENCY=4
+    LOG_LEVEL=info
+    LOG_PATH=/var/log/cpa/worker.log
+    ```
+  </Step>
+
+  <Step title="Start the master node">
+    Run the master service on your designated master machine. The process will bind to `MASTER_PORT` and begin accepting worker registrations.
+
+    ```bash
+    cpa-server start --role master --config .env
+    ```
+
+    Confirm the master is up before proceeding:
+
+    ```bash
+    curl http://localhost:4000/status
+    ```
+
+    Expected output:
+
+    ```json
+    {
+      "role": "master",
+      "status": "healthy",
+      "workers": [],
+      "uptime_seconds": 12
+    }
+    ```
+  </Step>
+
+  <Step title="Start worker nodes">
+    On each worker machine, start the worker service pointing at the master address you set in the worker `.env`.
+
+    <Tabs>
+      <Tab title="Protocol Engine worker">
+        ```bash
+        cpa-server start --role worker --engine protocol --config .env
+        ```
+      </Tab>
+      <Tab title="Browser Engine worker">
+        ```bash
+        cpa-server start --role worker --engine browser --config .env
+        ```
+      </Tab>
+    </Tabs>
+
+    Each worker will register itself with the master on startup. You should see a log line similar to:
+
+    ```
+    [INFO] Worker registered with master at http://<master-ip>:4000 (engine=browser, id=wkr_abc123)
+    ```
+  </Step>
+
+  <Step title="Verify cluster health">
+    Poll the master's `/status` endpoint to confirm all expected workers are registered and healthy.
+
+    ```bash
+    curl http://<master-ip>:4000/status | jq .
+    ```
+
+    A healthy multi-worker cluster returns:
+
+    ```json
+    {
+      "role": "master",
+      "status": "healthy",
+      "workers": [
+        { "id": "wkr_abc123", "engine": "browser", "status": "idle" },
+        { "id": "wkr_def456", "engine": "protocol", "status": "idle" }
+      ],
+      "task_queue_depth": 0,
+      "uptime_seconds": 94
+    }
+    ```
+
+    If a worker is missing, check its logs and confirm `MASTER_ADDRESS` is correct and the port is reachable.
+  </Step>
+</Steps>
+
+## Configuration reference
+
+The table below covers the most commonly adjusted settings beyond the minimal required values.
+
+| Key | Role | Default | Description |
+|-----|------|---------|-------------|
+| `MASTER_PORT` | Master | `4000` | Port the master API binds to |
+| `WORKER_CONCURRENCY` | Worker | `2` | Max parallel tasks per worker |
+| `ENGINE_TYPE` | Worker | `protocol` | `protocol` or `browser` |
+| `LOG_LEVEL` | Both | `info` | `debug`, `info`, `warn`, `error` |
+| `LOG_PATH` | Both | stdout | Absolute path for log file output |
+| `TASK_TIMEOUT_MS` | Both | `30000` | Per-task execution timeout in ms |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+    Set up health checks, metrics scraping, and log-based alerting for your running cluster.
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/operations/troubleshooting">
+    Diagnose and fix common issues like workers not connecting or tasks stuck in pending.
+  </Card>
+</CardGroup>

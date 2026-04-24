@@ -1,0 +1,177 @@
+---
+title: 'Monitor OpenAI CPA: Metrics, Logs, and Alerting Thresholds'
+description: 'Track worker health, task queue depth, success rates, and Mail Engine latency using the /status and /metrics endpoints, structured logs, and alert thresholds.'
+keywords: ['monitoring', 'metrics', 'health', 'logs', 'alerting', 'CPA cluster']
+---
+
+Effective monitoring of an OpenAI CPA cluster means watching four things closely: whether workers are alive and accepting tasks, how deep the task queue is growing, what your task success and failure rates look like, and how quickly the Mail Engine is polling inboxes for verification codes. The master node exposes two HTTP endpoints for this purpose, and all services write structured logs to a configurable path.
+
+## Key metrics to watch
+
+<CardGroup cols={2}>
+  <Card title="Worker health" icon="heart-pulse">
+    Each worker reports its status on registration and via periodic heartbeats. A worker that stops sending heartbeats is marked `unreachable` within 30 seconds.
+  </Card>
+  <Card title="Task queue depth" icon="layer-group">
+    Queue depth measures pending tasks waiting for an available worker. A growing queue that doesn't drain indicates insufficient worker capacity or stalled workers.
+  </Card>
+  <Card title="Success and failure rates" icon="chart-bar">
+    Track the ratio of completed vs. failed tasks over a rolling window. Sudden drops in success rate often indicate proxy issues or detection countermeasures.
+  </Card>
+  <Card title="Mail Engine polling latency" icon="envelope">
+    The time between a code being sent and the Mail Engine delivering it to the task. High latency here causes task timeouts on verification steps.
+  </Card>
+</CardGroup>
+
+## Status and metrics endpoints
+
+The master node exposes two endpoints. Both return JSON and require no authentication by default.
+
+### GET /status
+
+Returns a snapshot of cluster state: worker list, each worker's current status, and the current queue depth.
+
+```bash
+curl http://<master-ip>:4000/status
+```
+
+Example response:
+
+```json
+{
+  "role": "master",
+  "status": "healthy",
+  "uptime_seconds": 3842,
+  "task_queue_depth": 7,
+  "workers": [
+    {
+      "id": "wkr_abc123",
+      "engine": "browser",
+      "status": "busy",
+      "current_task": "task_9f2c",
+      "tasks_completed": 214,
+      "tasks_failed": 3
+    },
+    {
+      "id": "wkr_def456",
+      "engine": "protocol",
+      "status": "idle",
+      "current_task": null,
+      "tasks_completed": 891,
+      "tasks_failed": 11
+    }
+  ]
+}
+```
+
+### GET /metrics
+
+Returns Prometheus-compatible text exposition format. Suitable for scraping with Prometheus, Grafana Agent, or any compatible collector.
+
+```bash
+curl http://<master-ip>:4000/metrics
+```
+
+Example output:
+
+```text
+# HELP cpa_task_queue_depth Current number of tasks waiting in queue
+# TYPE cpa_task_queue_depth gauge
+cpa_task_queue_depth 7
+
+# HELP cpa_tasks_total Total tasks processed since start
+# TYPE cpa_tasks_total counter
+cpa_tasks_total{status="completed"} 1105
+cpa_tasks_total{status="failed"} 14
+cpa_tasks_total{status="timeout"} 2
+
+# HELP cpa_worker_status Current status of each worker (1=idle, 2=busy, 0=unreachable)
+# TYPE cpa_worker_status gauge
+cpa_worker_status{id="wkr_abc123",engine="browser"} 2
+cpa_worker_status{id="wkr_def456",engine="protocol"} 1
+
+# HELP cpa_mail_poll_latency_seconds Time from send to code delivery
+# TYPE cpa_mail_poll_latency_seconds histogram
+cpa_mail_poll_latency_seconds_bucket{le="5"} 320
+cpa_mail_poll_latency_seconds_bucket{le="15"} 498
+cpa_mail_poll_latency_seconds_bucket{le="30"} 511
+cpa_mail_poll_latency_seconds_bucket{le="+Inf"} 512
+cpa_mail_poll_latency_seconds_sum 3847.2
+cpa_mail_poll_latency_seconds_count 512
+```
+
+## Log files
+
+All services write structured JSON logs to the path set by `LOG_PATH` in your `.env` file. If `LOG_PATH` is not set, output goes to stdout.
+
+Example log entry at `info` level:
+
+```json
+{
+  "timestamp": "2026-04-24T10:32:11.042Z",
+  "level": "info",
+  "service": "worker",
+  "worker_id": "wkr_abc123",
+  "engine": "browser",
+  "event": "task_completed",
+  "task_id": "task_9f2c",
+  "duration_ms": 4231
+}
+```
+
+<Accordion title="Configuring log levels">
+  Set `LOG_LEVEL` in your `.env` file on each node. The four supported levels are processed in increasing severity order — setting a level shows that level and everything above it.
+
+  | Level | What is logged |
+  |-------|---------------|
+  | `debug` | All internal events, request traces, selector resolution steps |
+  | `info` | Task lifecycle events, worker registration, heartbeats |
+  | `warn` | Recoverable errors, retries, slow poll latency |
+  | `error` | Task failures, worker disconnects, unhandled exceptions |
+
+  Example `.env` entries:
+
+  ```ini
+  # Development — maximum verbosity
+  LOG_LEVEL=debug
+
+  # Production — recommended default
+  LOG_LEVEL=info
+
+  # Quiet production — only problems
+  LOG_LEVEL=warn
+  ```
+
+  <Warning>
+    Running `LOG_LEVEL=debug` in production generates very high log volume and can cause disk pressure on busy clusters. Use it only for short diagnostic sessions.
+  </Warning>
+</Accordion>
+
+## Alerting recommendations
+
+<Tip>
+  Configure alerts before your cluster goes into production. Reactive monitoring means you learn about problems from users, not your tooling.
+</Tip>
+
+The following table lists the most important alert thresholds. Adjust based on your workload profile.
+
+| Metric | Recommended alert threshold | Severity |
+|--------|----------------------------|----------|
+| `cpa_task_queue_depth` | > 50 for 5 minutes | Warning |
+| `cpa_task_queue_depth` | > 200 for 2 minutes | Critical |
+| Worker `status` = `unreachable` | Any worker for > 60 seconds | Warning |
+| `cpa_tasks_total{status="failed"}` rate | > 10% over 10-minute window | Warning |
+| `cpa_tasks_total{status="failed"}` rate | > 30% over 5-minute window | Critical |
+| `cpa_mail_poll_latency_seconds` p95 | > 20 seconds | Warning |
+| Master `/status` returning non-200 | Any occurrence | Critical |
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Deployment" icon="rocket" href="/operations/deployment">
+    Review system requirements and step-by-step cluster setup instructions.
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/operations/troubleshooting">
+    Common failure patterns and how to resolve them quickly.
+  </Card>
+</CardGroup>

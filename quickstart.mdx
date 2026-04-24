@@ -1,80 +1,279 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quickstart: Deploy OpenAI CPA and Run Your First Task"
+description: "Step-by-step guide to deploying the master node, registering a worker, configuring the mail engine, and submitting your first registration task."
+keywords: ["openai cpa quickstart", "deploy master node", "register worker", "mail engine setup", "first registration task"]
 ---
 
-## Get started in three steps
-
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+This guide walks you through a complete end-to-end setup of OpenAI CPA — from provisioning your servers to verifying that a registered account appears in the CPA Warehouse or is accessible via Sub2API. By the end you will have a running master node, at least one connected worker, a configured mail engine, and a completed registration task.
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  OpenAI CPA is licensed under CC BY-NC 4.0. Ensure your use case qualifies as non-commercial before proceeding.
 </Note>
+
+## Prerequisites
+
+Before starting, ensure you have the following in place:
+
+- **Master node server**: A Linux server (Ubuntu 22.04 LTS recommended) with at least 2 vCPUs and 4 GB RAM. This machine runs the control plane.
+- **Worker node server(s)**: One or more Linux servers with specs appropriate to your chosen engine. The Browser Engine requires more memory (4 GB+ per worker process) due to Chromium. The Protocol Engine is much lighter.
+- **Network connectivity**: Worker nodes must be able to reach the master node on its configured port. Firewall rules should permit this traffic.
+- **Email account(s)**: At least one inbox accessible via IMAP (or a supported custom API provider) for the Mail Engine to poll during verification steps.
+- **Docker**: Docker Engine installed on all nodes simplifies deployment and is the recommended approach.
+
+<Warning>
+  Do not expose the master node's API port to the public internet without authentication. Worker-to-master communication contains task credentials and registration data.
+</Warning>
+
+## Setup steps
+
+<Steps>
+  <Step title="Deploy the master node">
+    The master node runs the scheduler, task queue, and worker coordination service. Pull the master image and start it with your configuration.
+
+    Create a `master.yaml` configuration file on your master server:
+
+    ```yaml master.yaml
+    server:
+      port: 8080
+      host: "0.0.0.0"
+
+    scheduler:
+      max_concurrency: 500
+      retry_policy:
+        max_attempts: 3
+        backoff_seconds: 10
+      priority_queues:
+        - name: high
+          weight: 3
+        - name: default
+          weight: 1
+
+    storage:
+      type: sqlite
+      path: /data/openai-cpa.db
+    ```
+
+    Start the master using Docker:
+
+    ```bash
+    docker run -d \
+      --name openai-cpa-master \
+      --restart unless-stopped \
+      -p 8080:8080 \
+      -v $(pwd)/master.yaml:/app/config.yaml \
+      -v openai-cpa-data:/data \
+      wenfxl/openai-cpa-master:latest
+    ```
+
+    Confirm the master is healthy:
+
+    ```bash
+    curl http://localhost:8080/health
+    ```
+
+    A successful response returns `{"status":"ok"}`.
+
+    <Tip>
+      Set `host` to the master's private IP address if you want to restrict which interfaces the API binds to. Using `0.0.0.0` binds all interfaces — appropriate for Docker networking, but pair it with firewall rules in production.
+    </Tip>
+  </Step>
+
+  <Step title="Register a worker node">
+    Each worker node connects to the master, receives task assignments, and executes registrations using a configured engine. Create a `worker.yaml` on your worker server.
+
+    <Tabs>
+      <Tab title="Protocol Engine worker">
+        The Protocol Engine is lightweight. Higher concurrency values are practical because there is no browser overhead.
+
+        ```yaml worker.yaml
+        master:
+          host: "192.168.1.10"   # Replace with your master node's IP
+          port: 8080
+
+        worker:
+          id: "worker-protocol-01"
+          concurrency: 50
+
+        engine:
+          type: protocol
+        ```
+
+        Start the worker:
+
+        ```bash
+        docker run -d \
+          --name openai-cpa-worker \
+          --restart unless-stopped \
+          -v $(pwd)/worker.yaml:/app/config.yaml \
+          wenfxl/openai-cpa-worker:latest
+        ```
+      </Tab>
+      <Tab title="Browser Engine worker">
+        The Browser Engine launches Chromium processes. Limit concurrency based on available RAM — each browser instance uses approximately 300–500 MB.
+
+        ```yaml worker.yaml
+        master:
+          host: "192.168.1.10"   # Replace with your master node's IP
+          port: 8080
+
+        worker:
+          id: "worker-browser-01"
+          concurrency: 8
+
+        engine:
+          type: browser
+          browser:
+            headless: true
+            fingerprint_rotation: true
+        ```
+
+        Start the worker:
+
+        ```bash
+        docker run -d \
+          --name openai-cpa-worker-browser \
+          --restart unless-stopped \
+          --shm-size=2g \
+          -v $(pwd)/worker.yaml:/app/config.yaml \
+          wenfxl/openai-cpa-worker:latest
+        ```
+
+        <Note>
+          The `--shm-size=2g` flag increases shared memory for Chromium. Without it, browser processes may crash under load.
+        </Note>
+      </Tab>
+    </Tabs>
+
+    After starting the worker, verify it appears as connected on the master:
+
+    ```bash
+    curl http://localhost:8080/workers
+    ```
+
+    The response lists all connected workers with their IDs, engine types, and current status.
+  </Step>
+
+  <Step title="Configure the mail engine">
+    The Mail Engine polls email inboxes to extract verification codes that arrive during the registration flow. Add mail provider configuration to your master config or as a separate `mail.yaml`:
+
+    ```yaml mail.yaml
+    mail:
+      providers:
+        - id: "inbox-01"
+          type: imap
+          host: "imap.example.com"
+          port: 993
+          tls: true
+          username: "registrations@example.com"
+          password: "your-app-password"
+          poll_interval_seconds: 5
+          code_patterns:
+            - pattern: "\\b(\\d{6})\\b"
+              label: "6-digit verification code"
+    ```
+
+    Mount this config when starting the master, or include the `mail` block directly in `master.yaml`. The Mail Engine starts polling immediately on launch.
+
+    <Tip>
+      Use app-specific passwords for IMAP accounts rather than your primary account password. Most providers (Gmail, Outlook) support this under account security settings.
+    </Tip>
+
+    To add a custom API-based mail provider instead of IMAP, set `type: api` and supply the endpoint and authentication details. See [Mail providers](/mail/providers) for the full provider reference.
+  </Step>
+
+  <Step title="Submit your first registration task">
+    With the master running, a worker connected, and the mail engine polling, you are ready to submit a task. Tasks are submitted to the master's HTTP API as JSON payloads.
+
+    ```bash
+    curl -X POST http://localhost:8080/tasks \
+      -H "Content-Type: application/json" \
+      -d '{
+        "target": "example-service",
+        "engine": "protocol",
+        "quantity": 5,
+        "priority": "default",
+        "mail_provider_id": "inbox-01",
+        "params": {
+          "country": "US",
+          "username_format": "random_alpha8"
+        }
+      }'
+    ```
+
+    The master returns a task ID:
+
+    ```json
+    {
+      "task_id": "tsk_a1b2c3d4",
+      "status": "queued",
+      "quantity": 5,
+      "engine": "protocol"
+    }
+    ```
+
+    Poll task status using the returned ID:
+
+    ```bash
+    curl http://localhost:8080/tasks/tsk_a1b2c3d4
+    ```
+
+    <Note>
+      The `engine` field in the task payload determines which pool of workers handles the task. Workers only accept tasks matching their configured engine type.
+    </Note>
+  </Step>
+
+  <Step title="Check results in the CPA Warehouse or Sub2API">
+    Once workers complete registrations, accounts are stored automatically in the CPA Warehouse. You can retrieve them directly or via Sub2API.
+
+    **Query the CPA Warehouse directly:**
+
+    ```bash
+    curl http://localhost:8080/warehouse/accounts?task_id=tsk_a1b2c3d4
+    ```
+
+    A successful response returns the list of registered accounts with credentials and metadata:
+
+    ```json
+    {
+      "task_id": "tsk_a1b2c3d4",
+      "completed": 5,
+      "accounts": [
+        {
+          "id": "acc_001",
+          "username": "jkxlmqrp",
+          "email": "registrations+jkxlmqrp@example.com",
+          "registered_at": "2026-04-24T10:15:03Z",
+          "status": "active"
+        }
+      ]
+    }
+    ```
+
+    **Consume accounts via Sub2API:**
+
+    If you have downstream systems that need to pull accounts on demand, Sub2API exposes a stable HTTP endpoint:
+
+    ```bash
+    curl http://localhost:8080/sub2api/accounts?limit=1&status=active
+    ```
+
+    Sub2API supports filtering by status, target, and registration date. See [Sub2API](/warehouses/sub2api) for the full query reference.
+  </Step>
+</Steps>
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="Architecture overview" icon="diagram-project" href="/architecture">
+    Understand how all components fit together — master, workers, engines, mail engine, and warehouses.
+  </Card>
+  <Card title="Worker management" icon="server" href="/cluster/worker-management">
+    Add workers, configure pools, and monitor worker health in production.
+  </Card>
+  <Card title="Task scheduling" icon="calendar" href="/cluster/scheduling">
+    Configure concurrency limits, retry policies, and priority queues for your workloads.
+  </Card>
+  <Card title="Mail providers" icon="envelope" href="/mail/providers">
+    Add IMAP accounts or custom API mail providers to handle high verification volumes.
+  </Card>
+</CardGroup>
